@@ -280,3 +280,82 @@ Every later entry must follow this schema. Copy the block, fill in every field, 
 - The bot's container working directory is `/app`; the prompt template at runtime is read from `/app/prompts/retrieve.md`. The temp-file directory is irrelevant — downloads are in-memory.
 - The bot writes one row to `claude_calls` per retrieval, even on transient/timeout failures. Rate-limit dashboards should expect non-zero exit codes (`-1` timeout, `-2` malformed JSON, `-3` transient) as part of normal traffic rather than alert-worthy anomalies.
 - A `/find` argument that strips to empty replies with `Usage:` and does **not** call `claude -p`; the same is true for `/capture` with no body. The dashboard's chat surface should mirror this guard.
+
+---
+
+## Phase 5 — Compose orchestration & bootstrap
+
+**Date completed:** 2026-05-10
+**Session model:** Claude Opus 4.7 (1M context)
+
+### What was built
+- `infra/docker-compose.yml` — four-service stack (`capture_api`, `worker`, `telegram_bot`, `syncthing`) with named `claude_auth` volume, internal `memex_net` bridge, per-service memory limits, healthchecks, and a clearly-marked `# Phase 6: dashboard goes here` insertion point.
+- `infra/.env.example` — fully commented template covering every env var the compose file interpolates plus every service-side env var loaded via `env_file`.
+- `worker/Dockerfile` — replaced the runtime stage with one that adds Node + the `@anthropic-ai/claude-code` npm package, downloads `ggml-base.en.bin` to `/models/`, and sets `HOME=/home/memex` plus `MEMEX_WORKER_CLAUDE_BIN=/usr/local/bin/claude`.
+- `telegram_bot/Dockerfile` — same Claude-CLI install, plus `procps` for the pgrep healthcheck. Removed Phase 4's "claude binary mounted from host" model since Phase 5 bundles it.
+- `capture_api/Dockerfile` — left intact; defaults are overridden by compose to point at the canonical `/srv/memex/data/memex.db` path.
+- `scripts/bootstrap.sh` — interactive, idempotent first-time setup driver (root refusal, arch check, docker probe, prompts, `openssl rand -hex 32` capture token, host-dir creation via `sudo mkdir`, `infra/.env` writer with `--force` backup, `docker compose build`, headless `claude /login`, `up -d`, health-poll, self-test capture, operator summary).
+- `scripts/teardown.sh` — `down`, optional `--prune-images`, `--reset-claude-login` (volume rm with confirm), `--wipe-data` (deletes vault + queue, two confirms).
+- `scripts/lib/prompt.sh` — input + validation helpers (`ask`, `ask_yn`, validators for tokens, chat IDs, abs paths, ints, whisper models).
+- `scripts/lib/claude_login.sh` — drives `docker compose run --rm worker claude /login` with a clear pre-flight explanation, then a no-op `claude -p ping` smoke test inside the same volume context.
+- `docs/deployment.md` — full operator-facing guide: hardware, OS prep (incl. `/boot/firmware/cmdline.txt` cgroup tweak), Tailscale, bootstrap walkthrough, headless-login UX, first capture test, ops runbook, recovery scenarios, gotchas.
+- `tests/compose/test_compose_config.py` — 31 pytest assertions over the parsed `docker compose config` output: services present, ARM64 platform, restart policy, json-file logging with rotation, memory limits and total budget, healthcheck shapes, depends_on health gates, vault/data RO on telegram_bot and RW on worker/capture_api, `claude_auth` volume scoped to exactly worker + telegram_bot, capture_api publishes no host ports, syncthing UI bound to 127.0.0.1.
+- `tests/compose/test_env_coverage.py` — three assertions: every `${VAR}` in compose has an `.env.example` entry, every documented entry is referenced (or explicitly intentional), and `MEMEX_CAPTURE_API_TOKEN` is wired from `MEMEX_CAPTURE_TOKEN_telegram`.
+- `tests/compose/test_bootstrap.bats` — 6 bats cases: shellcheck clean, dry-run rejects bad tokens, dry-run accepts a valid configuration, dry-run rejects relative paths, refuses to run as root, rejects unknown flags. Tests skip gracefully when the test runner itself is root.
+
+### Key decisions made (and why)
+- **Compose file at `infra/docker-compose.yml`** (not the repo root). CLAUDE.md's "Repository layout" section pins it there; Phase 2/3/4 set the precedent of CLAUDE.md winning over the prompt when they disagree. `bootstrap.sh` and `teardown.sh` always pass `-f infra/docker-compose.yml`, so operators never have to remember the path.
+- **Project name `memex`** (not the prompt's `secondbrain`). Matches the package names, the `/srv/memex/...` host paths CLAUDE.md uses, and every existing env-var prefix.
+- **Host paths `/srv/memex/{vault,data,syncthing}`** — same reason. `MEMEX_VAULT_PATH`, `MEMEX_DATA_PATH`, `MEMEX_SYNCTHING_CONFIG` are operator-overridable in `.env`.
+- **Claude CLI installed via `npm install -g @anthropic-ai/claude-code`** rather than the new `curl https://claude.ai/install.sh | bash` native installer. The native installer puts files inside `~/.claude/local/`, which would conflict at runtime with our `claude_auth` volume mount at `/home/memex/.claude` (the volume would shadow the binary). The npm path puts the binary at `/usr/local/bin/claude` — completely outside `~/.claude/` — so the volume only ever holds auth state. Anthropic flags the npm package as deprecated upstream but it still works and is the only install method that's compatible with mounting a credentials volume at `~/.claude`. Phase 6 should keep this approach for the dashboard until/unless Anthropic changes the native installer's layout.
+- **Headless `claude /login` flow:** the bootstrap script `docker compose run --rm --no-deps --entrypoint /usr/local/bin/claude worker /login`, attaches the operator's TTY, and the CLI's own URL+code device-flow does the rest. The operator opens the URL on their laptop, signs in to Anthropic, copies the code Anthropic shows them, and pastes it back into the SSH session. After the CLI exits we run a `claude -p --output-format json "ping"` in the same volume context as a smoke test. This is the upstream-supported headless flow as of May 2026; we did not have to implement a Mac-side login + state-copy fallback.
+- **Single `claude_auth` named volume** mounted by both `worker` and `telegram_bot` (and, in Phase 6, the dashboard). One `claude /login` covers the entire stack.
+- **Memory budget** sized for a 4 GB Pi 5: capture_api 256 MiB, worker 1024 MiB (whisper.cpp + claude subprocess + extraction toolchain), telegram_bot 384 MiB (long-poll + claude subprocess), syncthing 256 MiB. Total 1920 MiB, leaving ~2 GiB for the host kernel, Pi-hole, and Linux page cache for the vault. The math is in the comment block at the top of `infra/docker-compose.yml`.
+- **Syncthing image pinned to `syncthing/syncthing:1.27.10`.** v1.27.10 is multi-arch with a published `linux/arm64` manifest, runs cleanly on Pi 5, and is the most recent v1 stable. We pinned to a tag (not a digest) so security updates inside the 1.27.x line are picked up by `docker compose pull` without an edit; bumping a major is a deliberate compose-file change.
+- **Telegram-bot healthcheck is a `pgrep` process-presence probe**, not a heartbeat-file probe. Phase 4's bot does not write a heartbeat file, and the prompt forbids modifying service code outside the Dockerfile. The Dockerfile installs `procps` so `pgrep -f "python -m bot.main"` works inside the container. Compose's restart policy is the recovery mechanism if the process disappears.
+- **Worker healthcheck is the heartbeat-file probe** the worker already maintains (`MEMEX_WORKER_HEALTHCHECK_PATH=/tmp/memex-worker.healthy`, touched at the end of every poll tick). The compose file declares it explicitly so `docker compose config` exposes it for tests; the Dockerfile keeps the same HEALTHCHECK as a fallback for non-compose runs.
+- **`env_file: ./.env` plus per-service `environment:` blocks.** `env_file` pushes everything in `infra/.env` (including the dynamic `MEMEX_CAPTURE_TOKEN_<LABEL>` set the capture API needs) into each container; the `environment:` blocks override defaults and pin the canonical paths (`/srv/memex/data/memex.db`, `/vault`, etc.). Tests assert that the bot's `MEMEX_CAPTURE_API_TOKEN` is wired specifically from `MEMEX_CAPTURE_TOKEN_telegram` so `submitter='api:telegram'` keeps working per Phase 1's note.
+- **No reverse proxy, no public ports.** `capture_api` does not publish any host port — the bot reaches it by service name on `memex_net`. Only Syncthing publishes (sync ports + LAN discovery), and its UI is bound to `127.0.0.1:8384` so operators reach it via SSH tunnel or Tailscale serve.
+
+### Deviations from the prompt spec
+- **Compose file at `infra/docker-compose.yml`, not the repo root.** Per CLAUDE.md (binding when it and the prompt disagree). Bootstrap and teardown scripts always pass `-f` so the operator never types the path.
+- **Project / host paths use `memex`, not `secondbrain`.** Same reason: CLAUDE.md is binding and every existing identifier is `memex`-prefixed.
+- **Telegram-bot healthcheck is process-presence, not last-poll-timestamp.** Phase 4's bot doesn't maintain a heartbeat file and the prompt forbids modifying its code; documented above.
+- **Capture-API token env-var is `MEMEX_CAPTURE_TOKEN_<LABEL>`** (Phase 2's choice from CLAUDE.md), not the prompt's bare `CAPTURE_API_TOKEN`. Bootstrap auto-fills `MEMEX_CAPTURE_TOKEN_telegram` from `openssl rand -hex 32` so the operator never sees the underlying name.
+- **`shared/memex_shared/` extraction is still deferred.** Phase 4 already noted this; nothing in Phase 5 forced the issue. Phase 6 (dashboard) will be the fourth service carrying a near-identical `logging.py` if it's not extracted by then.
+
+### Deferred / left for later phases
+- **Dashboard service (Phase 6).** A `# Phase 6: dashboard goes here` block in `infra/docker-compose.yml` documents the expected shape: build context `../dashboard`, depends_on `capture_api` healthy, `${MEMEX_VAULT_PATH}:/vault:ro`, `${MEMEX_DATA_PATH}:/srv/memex/data:ro`, `claude_auth:/home/memex/.claude`, no published ports (Tailscale serves it), `mem_limit ~256m`. Adding a `dashboard` service should not require any change to bootstrap or teardown — the script discovers services through `docker compose ps`/`config`.
+- **`shared/memex_shared/` package.** Same as Phase 4's note. Once the dashboard lands, four near-identical loggers + two queue DDL copies will exist; that is the right moment to extract.
+- **Tailscale ACL templates** for the operator. Not authored here; the deployment guide just points at the upstream installer and notes that the Syncthing UDP ports must be allowed if the ACLs are tightened.
+- **`tailscale serve` config** for exposing the Syncthing UI / dashboard — left for the operator to author once Phase 6 ships and there's something to expose.
+- **Container image signing / SBOM.** No cosign signatures, no SBOM emission, no image scanning. Single-user homelab.
+- **Periodic vault backups.** The deployment guide lists the rsync command but does not install a cron / systemd timer.
+
+### Open questions / known issues
+- **The npm `@anthropic-ai/claude-code` package is upstream-deprecated.** It works today, and is the only install path that doesn't conflict with a `~/.claude` volume mount, but Anthropic could remove it. If/when that happens we'll need to either (a) carve a separate `~/.claude-bin` install location and adjust the install script's prefix, or (b) install the native binary in a build stage and copy it into the runtime image, leaving auto-update disabled.
+- **Syncthing tag `1.27.10` is pinned by tag, not by digest.** A pinned digest would be more reproducible but requires a manual digest lookup; we pin to the tag and document the bump path. The deployment guide flags this.
+- **The Pi user's uid/gid (1000/1000) is captured at bootstrap time and burned into `infra/.env` as `MEMEX_UID`/`MEMEX_GID`.** If the operator later changes their uid (e.g. by recreating the user), Syncthing will lose write access until they edit `infra/.env` and `up -d` the syncthing service.
+- **Compose interpolation does not see vars exported by `env_file`.** The pattern `${MEMEX_CAPTURE_TOKEN_telegram}` works only because `infra/.env` is also the `--env-file` source for compose; if an operator separates them they will see an empty bot token. Bootstrap doesn't separate them.
+- **`docker compose run --rm --entrypoint /usr/local/bin/claude worker /login` uses `--no-deps`** so the capture API isn't started just to do a login. If the worker image's runtime user can't write `/home/memex/.claude/credentials.json` for any reason (e.g. SELinux, AppArmor), the login will silently appear to succeed but the volume will be empty; the smoke test catches this.
+- **Bats tests skip when run as root** because `bootstrap.sh` refuses to run as root. CI runners that run as root see the suite report 4 skipped + 2 passed; they should `runuser -u <non-root>` if they want full coverage.
+
+### Test status
+- `python -m pytest tests/compose/` → **34 passed** (compose config 31, env coverage 3). Includes parametrised checks across all four services for platform, restart, logging, and memory.
+- `bats tests/compose/test_bootstrap.bats` → **6 ok** when run as a non-root user (`su <user> -c 'bats ...'`); 4 skip + 2 pass when run as root, with a clear skip reason.
+- `shellcheck --severity=warning -x scripts/*.sh scripts/lib/*.sh` → clean.
+- `docker compose -f infra/docker-compose.yml --env-file <env> config` exits 0 against the synthetic env in the test fixture.
+- Not tested: an actual Pi 5 build of the worker / telegram_bot images. The `npm install -g @anthropic-ai/claude-code` step requires network egress and fetches an arm64-compatible binary; this should be exercised on the Pi during the first real bootstrap. Same for `whisper.cpp v1.7.2`'s arm64 build.
+- Not tested: an end-to-end "send URL to bot, see file in vault" round-trip. Acceptance criterion 2 in the prompt requires a Pi to exercise.
+
+### Notes for the next phase
+- **Dashboard insertion point** is in `infra/docker-compose.yml`; the `# Phase 6: dashboard goes here` block lists the expected mounts, depends_on, and memory budget. Add the service definition there; do NOT introduce a separate compose override file.
+- **Claude auth volume name** is `memex_claude_auth` (the docker-level name; the compose-level alias is `claude_auth`). Mount it on the dashboard container at `/home/memex/.claude` so retrieval calls reuse the same login.
+- **Port conventions:** capture_api binds 8001 inside the network and is unpublished. The dashboard should pick a different free port (suggested 8002) and either stay unpublished (Tailscale-served) or publish to `127.0.0.1` only.
+- **Memory headroom:** the budget leaves ~2 GiB free. The dashboard backend (FastAPI + a few SQLite reads + occasional `claude -p`) should fit in 256 MiB; the React build is static and served from inside that same container.
+- **`env_file: ./.env`** is the pattern; the dashboard service must also point at it so it picks up `MEMEX_LOG_LEVEL` and any future cross-cutting vars.
+- **Bootstrap script** does not need to know about the dashboard explicitly. Adding a service to compose is enough; `docker compose up -d` from the existing flow brings it up.
+- **Teardown's `--prune-images`** lists images by name; add `memex/dashboard:latest` to the loop in `scripts/teardown.sh` when the dashboard ships.
+- **The capture API's `env_file`** loads every `MEMEX_CAPTURE_TOKEN_*` label automatically; the dashboard, if it makes capture calls, should be configured with `MEMEX_CAPTURE_API_TOKEN=${MEMEX_CAPTURE_TOKEN_dashboard}` and `MEMEX_CAPTURE_TOKEN_dashboard` set in `.env` — `submitter` will then read `api:dashboard`.
+- **Worker / telegram_bot / capture_api Dockerfiles all run as uid 10001** (`memex` user). The dashboard should follow suit so the bind-mounted vault has uniform ownership semantics across services.
+
