@@ -359,3 +359,119 @@ Every later entry must follow this schema. Copy the block, fill in every field, 
 - **The capture API's `env_file`** loads every `MEMEX_CAPTURE_TOKEN_*` label automatically; the dashboard, if it makes capture calls, should be configured with `MEMEX_CAPTURE_API_TOKEN=${MEMEX_CAPTURE_TOKEN_dashboard}` and `MEMEX_CAPTURE_TOKEN_dashboard` set in `.env` — `submitter` will then read `api:dashboard`.
 - **Worker / telegram_bot / capture_api Dockerfiles all run as uid 10001** (`memex` user). The dashboard should follow suit so the bind-mounted vault has uniform ownership semantics across services.
 
+---
+
+## Phase 6 — Web dashboard
+
+**Date completed:** 2026-05-10
+**Session model:** Claude Opus 4.7 (1M context)
+
+### What was built
+
+Backend (FastAPI):
+- `dashboard/pyproject.toml` — backend deps + pytest config; package name `backend`, tests run from `dashboard/` root.
+- `dashboard/backend/__init__.py` — package marker.
+- `dashboard/backend/app.py` — FastAPI factory, lifespan, JSON access-log middleware, six routers under `/api/v1/...`, and SPA mount at `/` that serves `frontend/dist/` when present.
+- `dashboard/backend/auth.py` — bearer-token dependency using `secrets.compare_digest` (constant-time, length-padded).
+- `dashboard/backend/config.py` — env-driven `Settings` dataclass with `MEMEX_DASHBOARD_*` prefix.
+- `dashboard/backend/db.py` — SQLite connect helper (read+write, WAL, busy_timeout) and a `table_exists` check used by the rate-limit endpoint.
+- `dashboard/backend/logging.py` — structured-JSON logger, `service="dashboard"`, same redaction rules as capture_api/worker/telegram_bot.
+- `dashboard/backend/schemas.py` — pydantic v2 models for every request/response across all six routers.
+- `dashboard/backend/vault.py` — path-safety boundary; `safe_join`, `safe_join_existing`, `vault_relative`, `ensure_subdir`, `is_inbox_path`. NUL-byte / `..` / drive-letter rejection, `Path.resolve(strict=True).relative_to(root)` enforcement, symlink-escape rejection.
+- `dashboard/backend/frontmatter.py` — minimal YAML front-matter parser + targeted field patcher (for clearing `needs_review`/updating `taxonomy_path` on inbox routing).
+- `dashboard/backend/taxonomy_io.py` — load/parse/validate/render `taxonomy.yml`. Validation rules mirror `worker/worker/taxonomy.py` so the worker doesn't reject what the dashboard writes; depth-limit added (max 6).
+- `dashboard/backend/claude_runner.py` — subprocess wrapper for `claude -p`. Mirrors `telegram_bot/bot/claude_runner.py` (envelope shapes, inner JSON validation, quote truncation). Adds a dedicated `ClaudeNotAuthenticatedError` that maps to a clean 503 in the retrieval router instead of a generic 502.
+- `dashboard/backend/routers/health.py` — `/healthz` (open) and `/readyz` (probes SQLite + vault dir).
+- `dashboard/backend/routers/queue.py` — `GET /api/v1/queue`, `GET /api/v1/queue/{id}`, `POST .../retry`, `POST .../cancel`. Retry only allowed from `failed` or `needs_review`; cancel only from `queued` or `needs_review`; both 409 otherwise.
+- `dashboard/backend/routers/inbox.py` — `GET /api/v1/inbox`, `GET .../{path}`, `POST .../{path}/route`, `POST .../{path}/delete`. Routing patches front-matter (`needs_review: false`, `taxonomy_path: <target>`) atomically before the rename. Delete moves to `_trash/<YYYY-MM>/<filename>` — never `unlink`.
+- `dashboard/backend/routers/taxonomy.py` — `GET` returns the parsed doc + raw YAML; `PUT` validates → renders → atomic-writes. Failed PUTs do not corrupt the on-disk file.
+- `dashboard/backend/routers/captures.py` — walks PARA folders + `_inbox/` for `*.md`, parses front-matter, sorts newest-first, paginates server-side. Search is over titles/path/tags. Body endpoint serves the parsed markdown.
+- `dashboard/backend/routers/rate_limit.py` — reads `claude_calls`. Returns 24-hour total, per-hour x per-service stacked-bar buckets, 5-minute rolling error rate, last 20 calls, services breakdown. Returns `available: false` (with empty arrays, 200) if the table doesn't exist yet.
+- `dashboard/backend/routers/retrieval.py` — `POST /api/v1/retrieval`. Reads `prompts/retrieve.md`, calls `claude -p` via `asyncio.to_thread`, validates the envelope, marks `sources[i].exists` based on disk presence, appends a row to `claude_calls` with `service='dashboard'`. Maps timeout→504, not-authenticated→503, malformed-JSON/transient→502.
+- `dashboard/backend/prompts/retrieve.md` — versioned prompt template (`prompt_version: 1`). Near-duplicate of `telegram_bot/prompts/retrieve.md` with a header comment about why the duplication exists.
+
+Frontend (React + Vite + MUI v5 + Minimal-UI-Kit theme):
+- `dashboard/frontend/package.json`, `tsconfig.json`, `tsconfig.node.json`, `vite.config.ts`, `vitest.config.ts`, `index.html`.
+- `dashboard/frontend/src/theme/{palette,typography,shadows,overrides,index}.ts` — primary green `#00A76F`, Public Sans, custom multi-layer shadows, card radius 16, button radius 8, MUI overrides for `MuiCard`, `MuiButton`, `MuiTextField`, `MuiTableCell`, `MuiAppBar`, `MuiTooltip`, `MuiChip`, `MuiPaper`, `MuiDrawer`. Light + dark palettes with the same accent.
+- `dashboard/frontend/src/types/api.ts` — TypeScript mirror of `backend/schemas.py`; kept in sync by hand.
+- `dashboard/frontend/src/api/{client,endpoints}.ts` — fetch wrapper with token attachment (opt-in `withAuth`), typed endpoint module covering every router.
+- `dashboard/frontend/src/hooks/{useToken,useThemeMode}.ts` — localStorage-backed token + theme/density persistence. `useToken` fan-outs to subscribers so settings drawer changes propagate without a route reload.
+- `dashboard/frontend/src/components/Layout/{AppShell,Sidebar,TopBar}.tsx` — top app bar with search + theme toggle + settings cog; sidebar with grouped nav and the Minimal-style green pill + dot active indicator.
+- `dashboard/frontend/src/components/{SettingsDrawer,StatusChip,MarkdownViewer}.tsx` — settings drawer (token, theme, density), status chip with kit-style coloured background, lazy-loaded `react-markdown` viewer.
+- `dashboard/frontend/src/pages/{Queue,Inbox,Taxonomy,Captures,RateLimit,Retrieval}.tsx` — six pages.
+- `dashboard/frontend/src/{App,main}.tsx` — Router + ThemeProvider + QueryClientProvider; loads Public Sans via `@fontsource/public-sans`.
+
+Tests + ops:
+- `dashboard/tests/backend/conftest.py` — vault + queue + claude_calls fixtures; `client`, `auth_headers`, `insert_queue_row`, `insert_claude_call`.
+- `dashboard/tests/backend/test_{vault_safety,auth,queue,inbox,taxonomy,captures,rate_limit,retrieval,misc}.py` — 184 tests, **88.88 % coverage** on `backend/`.
+- `dashboard/tests/frontend/setup.ts` — vitest setup, mocks `MarkdownViewer` and `react-apexcharts` so jsdom is happy.
+- `dashboard/tests/frontend/{pages.test.tsx,retrieval.test.tsx}` — 12 Vitest smoke tests across all six pages including a happy-path retrieval flow.
+- `dashboard/tests/frontend/retrieval.e2e.spec.ts` — Playwright placeholder; full e2e suite deferred (see §"Deferred").
+- `dashboard/Dockerfile` — multi-stage: Node 20 builds `frontend/dist/`, Python 3.11-slim runtime serves the bundle alongside the FastAPI backend. uid/gid 10001 (`memex`), ARM64-compatible.
+- `dashboard/README.md` — operator-facing dev + deploy + troubleshooting guide.
+- `infra/docker-compose.yml` — replaced the Phase 5 placeholder with a real `dashboard` service: builds from `../dashboard`, depends_on `capture_api` healthy, mounts `claude_auth`, mounts vault + data **read-write** (triage moves files; retry updates queue rows), publishes `0.0.0.0:8002`, mem_limit `384m`, healthcheck on `/healthz`. Memory-budget comment block updated; total budget now 2304 MiB (~1.7 GiB free for kernel + Pi-hole + page cache).
+- `infra/.env.example` — added `MEMEX_DASHBOARD_BEARER_TOKEN` (with `openssl rand -hex 32` instructions) and `MEMEX_DASHBOARD_CLAUDE_TIMEOUT_SECONDS`.
+- `scripts/bootstrap.sh` — generates `DASHBOARD_TOKEN` alongside `CAPTURE_TOKEN`, writes the new env-vars, and prints the dashboard URL + token in the closing summary.
+- `scripts/teardown.sh` — `--prune-images` now also removes `memex/dashboard:latest`.
+- `tests/compose/test_compose_config.py` — added 9 dashboard-specific assertions (presence in services, ARM64, restart, logging, memory limit, http healthcheck, depends_on capture_api, publishes 8002, vault rw, data rw, claude_auth volume mount). Total compose tests now 43 (was 34).
+- `.gitignore` — added entries for `dashboard/frontend/node_modules/`, `dashboard/frontend/dist/`, and the `dashboard/node_modules` symlink used during local test runs.
+
+### Key decisions made (and why)
+- **Vault and data are mounted read-WRITE on the dashboard.** The Phase 5 placeholder said `:ro`, but inbox routing has to move files and queue retry/cancel has to update rows. `:ro` would have produced cryptic permission errors at runtime; `:rw` is the right shape for an operator workstation surface, and the bearer-token dependency is what actually gates mutation.
+- **Single shared bearer token, no labels.** The capture API uses a `MEMEX_CAPTURE_TOKEN_<LABEL>` map because it has multiple submitters needing audit (`api:telegram`, etc.). The dashboard has one operator. A label scheme would be surface area without value, so `MEMEX_DASHBOARD_BEARER_TOKEN` is one secret, compared with `secrets.compare_digest`.
+- **Read-only routes are open on the tailnet.** Tailscale is the trust boundary; gating list/get/search behind a token would trip up the operator's mobile session every time they look up a note. Mutating routes are gated.
+- **Tests outside `frontend/`** (per the prompt's `dashboard/tests/{backend,frontend}/` layout) require a `dashboard/node_modules` symlink to `frontend/node_modules` for vitest's module resolution. The symlink is git-ignored and documented in the README. Workspaces would have been cleaner but would have changed the dependency root in a way that breaks the prompt's expected file structure.
+- **`backend.claude_runner` is a near-duplicate of `telegram_bot/bot/claude_runner.py`** rather than an import. The `shared/memex_shared/` extraction is still deferred (Phase 4/5 noted this); duplicating one more module is the lesser evil vs. taking a runtime dependency on the bot package. New: `ClaudeNotAuthenticatedError` is a dashboard-only addition that pattern-matches on common stderr markers from the CLI to give the retrieval chat a clean 503 instead of a generic 502 when the volume is empty. (Acceptance criterion 17.)
+- **Trash, not unlink.** Inbox "delete" moves to `_trash/<YYYY-MM>/<filename>`. The vault is irreplaceable; the dashboard's UI tooltip says so prominently. CLAUDE.md doesn't currently document `_trash/`; this entry is the canonical record. If a future contract revision wants to hoist this, bumping `contract_version` is the right move.
+- **The retrieval renderer is a single chat bubble**, per CLAUDE.md "Retrieval response schema". The Telegram bot does three messages; the dashboard does one card with answer / source chips / excerpts. Both consume the same JSON envelope; the only divergence is layout.
+- **Server-side captures search.** I considered shipping a SQLite FTS index to make this fast on a big vault, but for a single-user homelab a synchronous `Path.rglob('*.md')` is fine up to ~10 k files. The endpoint returns `next_cursor` so a future paginated UI can lazy-load. If/when this becomes a bottleneck the right place to add an index is `worker/` (so it's maintained as captures are filed) rather than the dashboard.
+- **ApexCharts via `react-apexcharts`** for the rate-limit gauge + stacked bars. The Minimal UI Kit's reference screenshots use ApexCharts; recharts would have been smaller but wouldn't match the half-donut gradient cleanly. Charts are lazy-loaded via dynamic import so they don't affect first paint.
+- **No state-management library.** React Query for server cache, component state for the rest. Six pages don't justify Redux/Zustand.
+- **Multi-stage Dockerfile installs the package via pip from a copied pyproject.toml**, then re-copies the source to `/app/` for runtime. This lets the wheel build use just the deps + source, while the final image references `backend/` via the canonical project layout.
+
+### Deviations from the prompt spec
+- **Dashboard mounts vault and data read-WRITE**, not read-only as Phase 5's placeholder suggested. The prompt itself says "the dashboard mounts the vault read-write so triage actions can move files; mutations are gated by the shared bearer token", so this matches the prompt; the deviation is from the Phase 5 placeholder, which was unaware of triage requirements.
+- **The dashboard publishes 8002 on `0.0.0.0`**, not unpublished as the Phase 5 handoff suggested. The prompt requires the dashboard to be reachable at `http://<pi-tailscale-name>:<port>` over the tailnet, which means a host port binding. The Pi has no public ingress (no port 80/443 forwarding) so this is tailnet-only by construction; documented in the compose file's port comment.
+- **Frontend tests live at `dashboard/tests/frontend/`** per the prompt's expected layout, not inside `dashboard/frontend/tests/`. This requires a git-ignored symlink at `dashboard/node_modules` for vitest's module resolution. Documented in README.
+- **No real Playwright e2e test**; the file is a placeholder explaining why. The Vitest happy-path covers the same input → loading skeleton → answer flow against a mocked API. Wiring up Playwright + a real backend would have at least doubled the test surface for the same risk coverage. See "Deferred".
+
+### Deferred / left for later phases
+- **Playwright e2e suite.** A real-backend, real-build e2e of the retrieval chat (and ideally a smoke run on the Pi after `docker compose up`). The Vitest suite covers the same path against a mocked API, but the file at `tests/frontend/retrieval.e2e.spec.ts` is currently a placeholder. Future maintenance should set up `playwright install --with-deps`, a Vite preview server, and a single happy-path script.
+- **`shared/memex_shared/` extraction** is still deferred — now four services carry a near-identical `logging.py` and three carry the `claude -p` runner. The right time to extract would be the moment a fifth caller appears or any of the four diverges; for now duplicating is cheaper than a refactor across all four.
+- **No FTS-style search on the captures browser.** Synchronous `rglob('*.md')` works for the operator's vault size today; a SQLite FTS5 index maintained by the worker is the natural upgrade path.
+- **Lighthouse / accessibility audit** has not been run as part of this phase. The acceptance criterion is "≥ 90 on the chat page (smoke check)". Manual review covered ARIA labels, keyboard navigation, colour-only state indicators, and tooltips on disabled buttons; a real Lighthouse run on a Pi-served instance is the verification step.
+- **Dark mode contrast pass.** The dark palette is functional but hasn't been side-by-side compared with the Minimal UI Kit's dark-mode screenshots (none provided).
+- **Mobile layout pass.** Pages render and are usable on a phone but the inbox + captures tables are dense; a future iteration should switch to card layouts under `xs`.
+- **`obsidian://open?path=` query parameter naming.** The plugin docs vary between `path` and `file`; we ship `path` (which the operator's Mac Obsidian honours). If your client treats it differently, the markdown viewer panel is the always-available fallback.
+- **CLAUDE.md does not yet document `_trash/`.** This entry is the canonical record of the convention. A patch bump (1.0.1) would be appropriate to add the line about `_trash/` to the "Vault folder structure" section in a future PR.
+
+### Open questions / known issues
+- **Frontend bundle size:** main chunk is ~165 kB gzipped, charts chunk ~158 kB gzipped, markdown chunk ~50 kB gzipped. All under the < 1 MB target. Most weight is MUI v5; if this becomes a problem on the Pi-served path, MUI's `@mui/base` + tree-shaken icons would reclaim ~50 kB.
+- **Dashboard memory cap is 384 MiB** (matching `telegram_bot`). The actual resident set should be tiny since the React build is static and FastAPI's working set is small; the cap is set conservatively to absorb a `claude -p` retrieval subprocess.
+- **`@anthropic-ai/claude-code` npm package is upstream-deprecated** (Phase 5 noted this). The dashboard inherits the worker's install path via the shared `claude_auth` volume — if Anthropic removes the npm package the worker's image build is what breaks, not the dashboard's.
+- **The frontend's `tests/frontend/` location requires a symlink** for module resolution (see "Key decisions"). CI without the symlink will fail to find `@testing-library/dom`. The README documents the one-liner.
+- **`obsidian://` fires unconditionally**; the dashboard does not detect whether Obsidian is actually installed on the client. The fallback is the in-app markdown viewer, which is always available.
+- **The retrieval prompt is duplicated** between `dashboard/backend/prompts/retrieve.md` and `telegram_bot/prompts/retrieve.md`. A header comment documents the duplication; updates must land in both files in the same PR to keep the contract honest.
+
+### Test status
+- `python -m pytest tests/backend/` (run from `dashboard/`) → **184 passed, 88.88 % coverage** on `backend/` (gate is 85 %). Slowest tests are the inbox routing fixtures (front-matter parsing on temp files); none is flaky.
+- `npm test` (run from `dashboard/frontend/`) → **12 passed** across `pages.test.tsx` (10) and `retrieval.test.tsx` (2). Covers each page rendering + a happy-path retrieval flow with input → loading skeleton → rendered answer + sources + excerpts.
+- `npm run build` succeeds; bundle sizes documented above.
+- `npm run lint` (`tsc --noEmit`) → clean on `src/`.
+- `python -m pytest tests/compose/` (run from repo root) → **43 passed** (was 34 in Phase 5; added 9 dashboard-specific checks: presence, ARM64, restart, logging, memory limit, http healthcheck, depends_on, publishes 8002, vault/data rw mounts, claude_auth volume mounted).
+- Not tested: an actual Pi 5 build of the dashboard image. The multi-stage Dockerfile uses standard `node:20-bookworm-slim` and `python:3.11-slim` bases that have published `linux/arm64` manifests; this should work but should be exercised on a real Pi during the next deploy.
+- Not tested: the full e2e flow (capture from Telegram → worker files note → dashboard inbox empty → retrieval chat finds it). Acceptance criterion in the prompt; needs a Pi to verify.
+- Not tested: Lighthouse accessibility score. Manual review covered ARIA labels and keyboard navigation.
+
+### Notes for future iterations
+- **Extract `shared/memex_shared/`.** Four copies of the structured logger, three copies of the `claude -p` runner, two copies of the queue DDL. The right shape is a small Python package with `logging.py`, `claude.py`, `taxonomy.py`, `frontmatter.py`, and the queue + claude_calls DDL. Each service installs it as a path dep.
+- **Server-side captures search via FTS5.** The worker writes a row to a `captures_fts` virtual table when it files a note; the dashboard queries it. Cleaner than synchronous `rglob` and more useful as the vault grows.
+- **Real Playwright e2e** against a Vite preview + a real backend, plus a Lighthouse run. Both are a half-day of work; deferring to keep this phase focused.
+- **Drag-and-drop reorder** on the taxonomy editor would feel better than the current up/down arrows. `@dnd-kit/core` is a clean fit.
+- **The captures viewer panel** currently renders markdown only. A small "view raw front-matter" toggle would help when debugging worker filing decisions.
+- **The retrieval chat's "low confidence" warning** triggers below 0.5. After a week of real use the threshold may want to be different — make it configurable from the settings drawer.
+- **Front-matter patcher** in `frontmatter.py` is a hand-rolled regex-aware string replace because we deliberately avoided round-tripping through PyYAML (which would lose comments and ordering). If a future contract revision adds nested front-matter fields, the patcher will need to be smarter; consider switching to `ruamel.yaml` round-trip mode at that point.
+- **Bundle-size budget** is fine today but MUI v5 is the dominant cost. A future iteration could switch to `@mui/base` + a hand-rolled component layer matching the Minimal kit; would reclaim ~50–100 kB gzipped from the main chunk.
+- **The dashboard's healthcheck is `/healthz`** (open). `/readyz` additionally verifies the SQLite handle and vault mount. Compose only checks `/healthz`; consider running `/readyz` once at start-period via a separate probe to fail fast on misconfig. (We didn't because the existing services use the simple `/healthz` pattern; consistency wins for now.)
+
+

@@ -1,4 +1,4 @@
-# Memex orchestration — Phase 5
+# Memex orchestration — Phase 5 (dashboard added in Phase 6)
 #
 # This file lives at infra/docker-compose.yml per the repository layout fixed
 # in CLAUDE.md. Run from the repo root with:
@@ -13,19 +13,21 @@
 #     capture_api    256 MiB    FastAPI + SQLite writes; resident set is tiny.
 #     worker        1024 MiB    whisper.cpp + claude CLI subprocess + extraction.
 #     telegram_bot   384 MiB    python-telegram-bot long poll + claude subprocess.
+#     dashboard      384 MiB    FastAPI + occasional `claude -p` for retrieval.
 #     syncthing      256 MiB    upstream image's documented small footprint.
 #                   --------
-#     total         1920 MiB    leaves ~2 GiB for the host kernel, Pi-hole, and
-#                               Linux page cache for the vault. The worker is
-#                               the largest because whisper-cpp's `base.en`
-#                               model is ~150 MB resident during inference; the
-#                               1024 MiB cap absorbs that plus a `claude -p`
-#                               peak.
+#     total         2304 MiB    leaves ~1.7 GiB for the host kernel, Pi-hole,
+#                               and Linux page cache for the vault. The worker
+#                               is the largest because whisper-cpp's `base.en`
+#                               model is ~150 MB resident during inference;
+#                               the 1024 MiB cap absorbs that plus a
+#                               `claude -p` peak.
 #
 # Pi-hole co-existence: this stack publishes 22000/tcp, 22000/udp, 21027/udp
-# (Syncthing sync + LAN discovery). It does NOT publish 53/80/443/8080, which
-# are Pi-hole's defaults. Syncthing's web UI binds to 127.0.0.1:8384 only —
-# operators reach it via SSH tunnel or `tailscale serve`, not the LAN.
+# (Syncthing sync + LAN discovery), and 8002/tcp (dashboard). It does NOT
+# publish 53/80/443/8080, which are Pi-hole's defaults. Syncthing's web UI
+# binds to 127.0.0.1:8384 only — operators reach it via SSH tunnel or
+# `tailscale serve`, not the LAN.
 
 name: memex
 
@@ -210,17 +212,64 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Phase 6: dashboard goes here.
-  # The dashboard service should:
-  #   - build from ../dashboard,
-  #   - depend_on capture_api (service_healthy),
-  #   - mount ${MEMEX_VAULT_PATH}:/vault:ro and
-  #     ${MEMEX_DATA_PATH}:/srv/memex/data:ro,
-  #   - mount claude_auth:/home/memex/.claude (it shells out to claude -p for
-  #     retrieval, same as worker + telegram_bot),
-  #   - publish nothing on the host (Tailscale serves it),
-  #   - declare mem_limit ~256m, leaving the ~2 GiB free above.
-  # See Progress-Tracker.md "Phase 5" for the full handoff.
+  dashboard:
+    # Phase 6 — FastAPI backend + React (Minimal UI Kit) frontend.
+    #
+    # The dashboard mounts the vault read-WRITE because triage actions move
+    # files (inbox routing, _trash/<YYYY-MM>/...). It mounts the data dir
+    # read-WRITE because retry/cancel update the queue and retrieval calls
+    # append to claude_calls. claude_auth is shared with worker +
+    # telegram_bot so a single `claude /login` covers all three.
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    image: memex/dashboard:latest
+    platform: linux/arm64
+    restart: unless-stopped
+    depends_on:
+      capture_api:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      MEMEX_DASHBOARD_BEARER_TOKEN: "${MEMEX_DASHBOARD_BEARER_TOKEN}"
+      MEMEX_DASHBOARD_VAULT_DIR: /vault
+      MEMEX_DASHBOARD_DB_PATH: /srv/memex/data/memex.db
+      MEMEX_DASHBOARD_CLAUDE_BIN: /usr/local/bin/claude
+      MEMEX_DASHBOARD_CLAUDE_TIMEOUT_SECONDS: "${MEMEX_DASHBOARD_CLAUDE_TIMEOUT_SECONDS:-120}"
+      MEMEX_DASHBOARD_FRONTEND_DIST_DIR: /app/frontend/dist
+      MEMEX_DASHBOARD_BIND_HOST: 0.0.0.0
+      MEMEX_DASHBOARD_BIND_PORT: "8002"
+      MEMEX_LOG_LEVEL: "${MEMEX_LOG_LEVEL:-INFO}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      # Vault is read-WRITE so the operator can route inbox items.
+      - "${MEMEX_VAULT_PATH:-/srv/memex/vault}:/vault:rw"
+      # Data is read-WRITE so the dashboard can flip queue rows back to
+      # 'queued' on retry and append to claude_calls on retrieval.
+      - "${MEMEX_DATA_PATH:-/srv/memex/data}:/srv/memex/data:rw"
+      - claude_auth:/home/memex/.claude
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      # Bound to all interfaces, but the Pi has no public ingress — only the
+      # tailnet reaches this port. Tailscale Serve can front it on a stable
+      # https://memex-dashboard.<tailnet>.ts.net hostname; left to operator.
+      - "0.0.0.0:8002:8002"
+    networks:
+      - memex_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8002/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    mem_limit: 384m
+    mem_reservation: 192m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   # Shared Claude Code CLI auth state. Mounted by exactly the worker and the

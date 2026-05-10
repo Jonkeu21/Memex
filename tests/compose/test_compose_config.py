@@ -114,12 +114,13 @@ def test_expected_services(parsed: dict):
         "worker",
         "telegram_bot",
         "syncthing",
+        "dashboard",
     }
 
 
 @pytest.mark.parametrize(
     "service",
-    ["capture_api", "worker", "telegram_bot", "syncthing"],
+    ["capture_api", "worker", "telegram_bot", "syncthing", "dashboard"],
 )
 def test_platform_arm64(parsed: dict, service: str):
     assert parsed["services"][service].get("platform") == "linux/arm64"
@@ -127,7 +128,7 @@ def test_platform_arm64(parsed: dict, service: str):
 
 @pytest.mark.parametrize(
     "service",
-    ["capture_api", "worker", "telegram_bot", "syncthing"],
+    ["capture_api", "worker", "telegram_bot", "syncthing", "dashboard"],
 )
 def test_restart_policy(parsed: dict, service: str):
     assert parsed["services"][service].get("restart") == "unless-stopped"
@@ -135,7 +136,7 @@ def test_restart_policy(parsed: dict, service: str):
 
 @pytest.mark.parametrize(
     "service",
-    ["capture_api", "worker", "telegram_bot", "syncthing"],
+    ["capture_api", "worker", "telegram_bot", "syncthing", "dashboard"],
 )
 def test_logging_driver_with_rotation(parsed: dict, service: str):
     logging = parsed["services"][service].get("logging", {})
@@ -152,6 +153,7 @@ def test_logging_driver_with_rotation(parsed: dict, service: str):
         ("worker", 1024 * 1024 * 1024),
         ("telegram_bot", 384 * 1024 * 1024),
         ("syncthing", 256 * 1024 * 1024),
+        ("dashboard", 384 * 1024 * 1024),
     ],
 )
 def test_memory_limits(parsed: dict, service: str, limit_bytes: int):
@@ -170,7 +172,7 @@ def test_memory_limits(parsed: dict, service: str, limit_bytes: int):
 def test_total_memory_budget_under_3gb(parsed: dict):
     total = sum(
         int(parsed["services"][s]["mem_limit"])
-        for s in ["capture_api", "worker", "telegram_bot", "syncthing"]
+        for s in ["capture_api", "worker", "telegram_bot", "syncthing", "dashboard"]
     )
     # Budget ceiling per the compose-file comment block.
     assert total < 3 * 1024 * 1024 * 1024
@@ -240,8 +242,9 @@ def test_data_writable_on_worker_and_capture_api(parsed: dict):
         assert mode == "rw", f"{svc} should mount data rw"
 
 
-def test_claude_auth_volume_only_on_worker_and_telegram_bot(parsed: dict):
-    """The shared CLI auth volume is mounted by exactly worker + telegram_bot."""
+def test_claude_auth_volume_on_claude_callers(parsed: dict):
+    """The shared CLI auth volume is mounted by exactly the services that
+    shell out to ``claude -p``: worker, telegram_bot, and dashboard."""
     by_service: dict[str, bool] = {}
     for svc, body in parsed["services"].items():
         mounts = body.get("volumes", []) or []
@@ -256,7 +259,41 @@ def test_claude_auth_volume_only_on_worker_and_telegram_bot(parsed: dict):
         "worker": True,
         "telegram_bot": True,
         "syncthing": False,
+        "dashboard": True,
     }
+
+
+def test_dashboard_has_http_healthcheck(parsed: dict):
+    hc = parsed["services"]["dashboard"].get("healthcheck", {})
+    test = hc.get("test") or []
+    assert any("/healthz" in str(part) for part in test), test
+
+
+def test_dashboard_depends_on_capture_api_healthy(parsed: dict):
+    deps = parsed["services"]["dashboard"].get("depends_on", {})
+    assert deps.get("capture_api", {}).get("condition") == "service_healthy"
+
+
+def test_dashboard_publishes_8002(parsed: dict):
+    ports = parsed["services"]["dashboard"].get("ports", []) or []
+    targets = [int(p.get("target", 0)) for p in ports]
+    assert 8002 in targets, f"dashboard must publish 8002, found {targets}"
+
+
+def test_vault_writable_on_dashboard(parsed: dict):
+    """Triage actions move inbox files; vault must be rw."""
+    mode = _volume_mode(
+        parsed["services"]["dashboard"].get("volumes", []), "/vault"
+    )
+    assert mode == "rw", f"dashboard vault must be rw, got {mode}"
+
+
+def test_data_writable_on_dashboard(parsed: dict):
+    """Retry/cancel updates queue rows; retrieval appends to claude_calls."""
+    mode = _volume_mode(
+        parsed["services"]["dashboard"].get("volumes", []), "/srv/memex/data"
+    )
+    assert mode == "rw", f"dashboard data must be rw, got {mode}"
 
 
 def test_capture_api_does_not_publish_ports(parsed: dict):
