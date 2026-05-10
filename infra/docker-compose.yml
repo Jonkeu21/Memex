@@ -1,0 +1,235 @@
+# Memex orchestration — Phase 5
+#
+# This file lives at infra/docker-compose.yml per the repository layout fixed
+# in CLAUDE.md. Run from the repo root with:
+#
+#     docker compose -f infra/docker-compose.yml up -d
+#
+# scripts/bootstrap.sh and scripts/teardown.sh always pass `-f` for you; only
+# operators running compose by hand need to remember it.
+#
+# Memory budget for a Raspberry Pi 5 / 4 GB:
+#
+#     capture_api    256 MiB    FastAPI + SQLite writes; resident set is tiny.
+#     worker        1024 MiB    whisper.cpp + claude CLI subprocess + extraction.
+#     telegram_bot   384 MiB    python-telegram-bot long poll + claude subprocess.
+#     syncthing      256 MiB    upstream image's documented small footprint.
+#                   --------
+#     total         1920 MiB    leaves ~2 GiB for the host kernel, Pi-hole, and
+#                               Linux page cache for the vault. The worker is
+#                               the largest because whisper-cpp's `base.en`
+#                               model is ~150 MB resident during inference; the
+#                               1024 MiB cap absorbs that plus a `claude -p`
+#                               peak.
+#
+# Pi-hole co-existence: this stack publishes 22000/tcp, 22000/udp, 21027/udp
+# (Syncthing sync + LAN discovery). It does NOT publish 53/80/443/8080, which
+# are Pi-hole's defaults. Syncthing's web UI binds to 127.0.0.1:8384 only —
+# operators reach it via SSH tunnel or `tailscale serve`, not the LAN.
+
+name: memex
+
+services:
+  capture_api:
+    build:
+      context: ../capture_api
+      dockerfile: Dockerfile
+    image: memex/capture_api:latest
+    platform: linux/arm64
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      # Override the image defaults so all three writers point at the single
+      # SQLite file CLAUDE.md mandates at /srv/memex/data/memex.db.
+      CAPTURE_DB_PATH: /srv/memex/data/memex.db
+      CAPTURE_INBOX_DIR: /srv/memex/data/uploads
+      CAPTURE_BIND_HOST: 0.0.0.0
+      CAPTURE_BIND_PORT: "8001"
+      CAPTURE_MAX_UPLOAD_MB: "${MEMEX_CAPTURE_MAX_UPLOAD_MB:-25}"
+      LOG_LEVEL: "${MEMEX_LOG_LEVEL:-INFO}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - "${MEMEX_DATA_PATH:-/srv/memex/data}:/srv/memex/data:rw"
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - memex_net
+    # No ports: published. The bot reaches the API by service name on the
+    # internal bridge network. Tailscale exposure (if any) is host-side.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    mem_limit: 256m
+    mem_reservation: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker:
+    build:
+      context: ../worker
+      dockerfile: Dockerfile
+    image: memex/worker:latest
+    platform: linux/arm64
+    restart: unless-stopped
+    depends_on:
+      capture_api:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      MEMEX_WORKER_DB_PATH: /srv/memex/data/memex.db
+      MEMEX_WORKER_VAULT_DIR: /vault
+      MEMEX_WORKER_INBOX_DIR: /srv/memex/data/uploads
+      MEMEX_WORKER_TAXONOMY_PATH: /vault/_meta/taxonomy.yml
+      MEMEX_WORKER_POLL_SECONDS: "${MEMEX_WORKER_POLL_SECONDS:-5}"
+      MEMEX_WORKER_BATCH_PAUSE_SECONDS: "${MEMEX_WORKER_BATCH_PAUSE_SECONDS:-60}"
+      MEMEX_WORKER_BATCH_MAX: "${MEMEX_WORKER_BATCH_MAX:-10}"
+      MEMEX_WORKER_MAX_ATTEMPTS: "${MEMEX_WORKER_MAX_ATTEMPTS:-5}"
+      MEMEX_WORKER_CLAUDE_BIN: /usr/local/bin/claude
+      MEMEX_WORKER_CLAUDE_TIMEOUT_SECONDS: "${MEMEX_WORKER_CLAUDE_TIMEOUT_SECONDS:-180}"
+      MEMEX_WORKER_WHISPER_MODEL: "/models/${MEMEX_WHISPER_MODEL_FILE:-ggml-base.en.bin}"
+      MEMEX_LOG_LEVEL: "${MEMEX_LOG_LEVEL:-INFO}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - "${MEMEX_VAULT_PATH:-/srv/memex/vault}:/vault:rw"
+      - "${MEMEX_DATA_PATH:-/srv/memex/data}:/srv/memex/data:rw"
+      - claude_auth:/home/memex/.claude
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - memex_net
+    healthcheck:
+      # The worker touches /tmp/memex-worker.healthy at the end of every poll
+      # tick; the file must have been modified within the last 2 minutes.
+      test: ["CMD-SHELL", "test -f /tmp/memex-worker.healthy && find /tmp/memex-worker.healthy -mmin -2 | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    mem_limit: 1024m
+    mem_reservation: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  telegram_bot:
+    build:
+      context: ../telegram_bot
+      dockerfile: Dockerfile
+    image: memex/telegram_bot:latest
+    platform: linux/arm64
+    restart: unless-stopped
+    depends_on:
+      capture_api:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      MEMEX_TELEGRAM_BOT_TOKEN: "${MEMEX_TELEGRAM_BOT_TOKEN}"
+      MEMEX_TELEGRAM_ALLOWED_CHAT_IDS: "${MEMEX_TELEGRAM_ALLOWED_CHAT_IDS}"
+      MEMEX_TELEGRAM_VAULT_DIR: /vault
+      MEMEX_TELEGRAM_DB_PATH: /srv/memex/data/memex.db
+      MEMEX_CAPTURE_API_BASE_URL: http://capture_api:8001
+      # Bot-side capture token; must equal MEMEX_CAPTURE_TOKEN_telegram so the
+      # capture API tags rows as submitter='api:telegram'.
+      MEMEX_CAPTURE_API_TOKEN: "${MEMEX_CAPTURE_TOKEN_telegram}"
+      MEMEX_TELEGRAM_CLAUDE_BIN: /usr/local/bin/claude
+      MEMEX_TELEGRAM_CLAUDE_TIMEOUT_SECONDS: "${MEMEX_TELEGRAM_CLAUDE_TIMEOUT_SECONDS:-120}"
+      MEMEX_TELEGRAM_MAX_DOWNLOAD_MB: "${MEMEX_TELEGRAM_MAX_DOWNLOAD_MB:-25}"
+      MEMEX_LOG_LEVEL: "${MEMEX_LOG_LEVEL:-INFO}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      # Vault is read-only here: the bot only ever reads it via `claude -p`.
+      - "${MEMEX_VAULT_PATH:-/srv/memex/vault}:/vault:ro"
+      # Data is read-only here: the bot reads /queue and /last but never writes
+      # the queue. Phase 4's claude_calls telemetry insert is best-effort and
+      # is intentionally tolerated as a no-op when the mount is read-only.
+      - "${MEMEX_DATA_PATH:-/srv/memex/data}:/srv/memex/data:ro"
+      - claude_auth:/home/memex/.claude
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - memex_net
+    healthcheck:
+      # Process-presence probe: the bot has no HTTP surface and Phase 4's
+      # implementation does not write a heartbeat file. The Dockerfile installs
+      # `procps` so `pgrep` is available.
+      test: ["CMD-SHELL", "pgrep -f 'python -m bot.main' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    mem_limit: 384m
+    mem_reservation: 192m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  syncthing:
+    # Pinned to the 1.27.x line: 1.27.10 is published as a multi-arch manifest
+    # including linux/arm64, runs on Raspberry Pi 5, and is the most recent
+    # stable Syncthing v1 at the time of writing. We pin to a tag (not a
+    # digest) so security updates inside the 1.27.x line are picked up by a
+    # `docker compose pull` without an edit; bumping a major (2.x) requires a
+    # deliberate compose-file change.
+    image: syncthing/syncthing:1.27.10
+    platform: linux/arm64
+    restart: unless-stopped
+    hostname: memex-pi
+    environment:
+      PUID: "${MEMEX_UID:-1000}"
+      PGID: "${MEMEX_GID:-1000}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - "${MEMEX_SYNCTHING_CONFIG:-/srv/memex/syncthing}:/var/syncthing:rw"
+      - "${MEMEX_VAULT_PATH:-/srv/memex/vault}:/var/syncthing/vault:rw"
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      # Web UI bound to localhost only; reach it over SSH tunnel or Tailscale.
+      - "127.0.0.1:8384:8384"
+      # Sync + LAN discovery — Syncthing needs these on the host network so
+      # NAT-traversal works against the Mac peer.
+      - "22000:22000/tcp"
+      - "22000:22000/udp"
+      - "21027:21027/udp"
+    networks:
+      - memex_net
+    mem_limit: 256m
+    mem_reservation: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Phase 6: dashboard goes here.
+  # The dashboard service should:
+  #   - build from ../dashboard,
+  #   - depend_on capture_api (service_healthy),
+  #   - mount ${MEMEX_VAULT_PATH}:/vault:ro and
+  #     ${MEMEX_DATA_PATH}:/srv/memex/data:ro,
+  #   - mount claude_auth:/home/memex/.claude (it shells out to claude -p for
+  #     retrieval, same as worker + telegram_bot),
+  #   - publish nothing on the host (Tailscale serves it),
+  #   - declare mem_limit ~256m, leaving the ~2 GiB free above.
+  # See Progress-Tracker.md "Phase 5" for the full handoff.
+
+volumes:
+  # Shared Claude Code CLI auth state. Mounted by exactly the worker and the
+  # telegram_bot (and, in Phase 6, the dashboard). Persisting this across
+  # `docker compose down` is what lets a single `claude login` cover the stack.
+  claude_auth:
+    name: memex_claude_auth
+
+networks:
+  memex_net:
+    name: memex_net
+    driver: bridge
