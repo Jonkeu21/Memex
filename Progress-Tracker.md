@@ -474,4 +474,53 @@ Tests + ops:
 - **Bundle-size budget** is fine today but MUI v5 is the dominant cost. A future iteration could switch to `@mui/base` + a hand-rolled component layer matching the Minimal kit; would reclaim ~50–100 kB gzipped from the main chunk.
 - **The dashboard's healthcheck is `/healthz`** (open). `/readyz` additionally verifies the SQLite handle and vault mount. Compose only checks `/healthz`; consider running `/readyz` once at start-period via a separate probe to fail fast on misconfig. (We didn't because the existing services use the simple `/healthz` pattern; consistency wins for now.)
 
+---
+
+## Docs: Installation guide
+
+**Date completed:** 2026-05-10
+**Session model:** Claude Opus 4.7 (1M context)
+
+### What was built
+- `docs/installation.md` — a single self-contained, beginner-friendly install walkthrough that takes a reader from a freshly bought Raspberry Pi 5 to a working Memex (first capture visible in the vault, dashboard reachable from the laptop). Covers: hardware checklist, account checklist, system overview, 11 numbered installation phases (Pi prep, base software, Tailscale, Telegram bot, source clone, bootstrap, headless `claude /login`, stack-up, first capture, dashboard, Syncthing pairing), a "day-to-day" operations block, a 6-entry troubleshooting block, and a "where to go next" pointer block.
+
+### Key decisions made (and why)
+- **Phase headings use a colon, not an em dash** (`## Phase 1: Prepare the Raspberry Pi`). The prompt forbids em dashes globally and applies the same rule to this Progress-Tracker entry's heading. The previous Phase 1..6 entries use em dashes in their headings; that is intentional history that we do not edit.
+- **Wrote a fresh walkthrough rather than reframing `docs/deployment.md`.** The deployment doc is a concise runbook for someone who knows the stack; the install guide is a step-by-step for someone meeting it for the first time. The two now point at each other instead of duplicating content. Where overlap was unavoidable (the `claude /login` walkthrough, the operations runbook commands), the install guide stays at the introductory level and refers down to `docs/deployment.md` for deeper detail.
+- **Inline term definitions, no glossary.** SSH, container, image, volume, bind mount, tailnet, Compose, service, Homebrew, cgroups, and a few others are each defined in five to fifteen words the first time they appear, then used freely. A separate glossary would have either been ignored or skimmed.
+- **Expected-output blocks are representative, not exact.** Most show the last few lines of long outputs with an ellipsis. The bootstrap build, `docker compose ps`, and the worker log stream are the long-output cases; trimming them keeps the page scannable.
+- **All shell snippets that span multiple commands are kept in a single fenced block** so the reader can copy them as one paste. The exception is the BotFather flow, which is interactive and has no commands.
+- **Sentence-length and forbidden-character rules are programmatic.** A single Python script lives at `/tmp/style_check.py` during authoring (not committed); it strips fenced code blocks and inline-code spans, then scans prose for em dashes, prose-position `--`, non-ASCII pictographs, and any sentence over 25 words. Final run is clean on all four.
+
+### Deviations from the prompt spec
+- **Phase 6 of the prompt vs. the bootstrap script's actual default for `MEMEX_WORKER_BATCH_PAUSE_SECONDS`.** The script prompts with a default of `300`; `infra/.env.example` and `CLAUDE.md` ("Worker contract") list `60`. The install guide quotes the value the operator actually sees in the prompt (`300`) per the working note that says "the script wins". This is not a guide bug; it is a real divergence between the script's prompt default and the example env / contract. Flagging it here so a later session can decide whether to reconcile (likely by patching the bootstrap default down to 60 to match `CLAUDE.md`'s `Worker contract` section, which would not require a contract version bump).
+- **No external links beyond the Raspberry Pi software page, the Tailscale installer URL, and the Syncthing downloads page.** The prompt forbids "links to external tutorials"; the three URLs above are the canonical install endpoints, not tutorials.
+
+### Deferred / left for later phases
+- **Reconciliation of `MEMEX_WORKER_BATCH_PAUSE_SECONDS` default.** See the "Deviations" entry above. The right fix is a one-line change in `scripts/bootstrap.sh` (from `"300"` to `"60"`). Not done in this session to keep the diff to the guide alone.
+- **Verification on a real Pi.** Acceptance criterion 5 requires a fresh-Pi run-through; not exercised here. A user testing the guide should report any step that needs more detail, especially in phase 7 (headless login).
+- **Per-phase screenshots.** The prompt forbids referencing screenshots that do not exist; visual references are described in prose instead. A future revision could add screenshots once the Pi 5 + dashboard is exercised on real hardware.
+
+### Open questions / known issues
+- **The `<your-fork>` placeholder in the `git clone` step.** The repo's canonical GitHub URL is not documented in `CLAUDE.md` or `Progress-Tracker.md`. The guide tells the reader to ask the operator who set up the fork. If a canonical public URL is ever published, the placeholder should be replaced with it.
+- **Tailscale account flow varies.** The guide assumes a free single-user account where the first device prompts authentication via a browser. If the operator is on a multi-account/SSO setup, the device-add step looks slightly different. The fix is a footnote pointing at the Tailscale account selection screen; not added because it would expand surface area for a corner case.
+- **The bot's first reply text** (`Queued #1 (url). I'll let you know where it lands.`) is the text from `CLAUDE.md`'s Telegram bot contract. If the bot implementation diverged in Phase 4, the guide may show a slightly different string than what the operator sees. The Phase 4 entry's "What was built" does not flag a divergence, but a user-test pass is the verification.
+- **The `--build` flag on update.** The update block uses `docker compose up -d --build`. This rebuilds every image, which is slower than rebuilding only changed images. A future doc revision could mention `docker compose build --pull` for separating the two phases, but the single command is the safer recommendation for beginners.
+
+### Test status
+- `style_check.py` over `docs/installation.md`:
+  - em-dash matches: **0**
+  - prose `--` matches: **0**
+  - non-ASCII / emoji matches: **0**
+  - sentences > 25 words: **0**
+- Manual review against the §4 structure in the prompt: all 11 phases present, in the required order, with the required content (explanation prose, command, expected output, common pitfalls inline where applicable).
+- Manual cross-check against `CLAUDE.md`: service names (`capture_api`, `worker`, `telegram_bot`, `dashboard`, `syncthing`), env-var names (`MEMEX_TELEGRAM_ALLOWED_CHAT_IDS`, `MEMEX_DASHBOARD_BEARER_TOKEN`, `MEMEX_CAPTURE_TOKEN_<LABEL>`), paths (`/srv/memex/{vault,data,syncthing}`), and ports (8002 dashboard, 8001 capture API internal, 8384 Syncthing UI on localhost, 22000 + 21027 Syncthing sync) all match the contract.
+- Not tested: an actual Pi 5 walkthrough. Verification requires a fresh device.
+
+### Notes for the next session
+- **Treat the install guide as a stable surface.** Future architectural changes (a new service, a new env var, a renamed path) need to be reflected in three places: `CLAUDE.md` (contract), `docs/deployment.md` (runbook), and `docs/installation.md` (this guide). The guide is the most expensive to update because it is the one document where prose carries weight; budget for it when changing the public surface.
+- **Style rules live in this entry, not in a separate style guide file.** The forbidden characters (em dash, prose `--`, emoji) and the 25-word sentence cap are the contract for any future revision. The `style_check.py` script in the "Test status" block above is the way to verify a revision.
+- **`docs/deployment.md` is the right place to keep developer-oriented detail.** If a new tunable is added to `infra/.env`, document it in deployment.md, not in installation.md. The install guide should grow only when the install flow itself changes (new prompt in bootstrap, new account to create, new phase in compose).
+- **Bootstrap default reconciliation.** As noted in "Deferred", changing `"300"` to `"60"` in `scripts/bootstrap.sh` line 152 (the `PAUSE_SECONDS` prompt) would resolve the only contract divergence the install guide has to step around. A patch-level contract version bump is not required because `CLAUDE.md` already pins the default at 60.
+
 
