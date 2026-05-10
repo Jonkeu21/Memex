@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+.mypy_cache
+.ruff_cache
+.tox
+htmlcov
+tests
+.git
+.gitignore
+README.md

@@ -208,3 +208,75 @@ Every later entry must follow this schema. Copy the block, fill in every field, 
 - The `claude_calls` table is shared write surface; the bot must `INSERT` rows with `service='telegram_bot'`, `purpose='retrieve'`, and `queue_item_id=NULL`. Same nine columns, idempotent migration — `apply_migrations` in `worker/worker/db.py` will be a no-op for already-applied files.
 - `worker/worker/db.py::insert_queue_row` is a test helper; production capture comes from `capture_api`. Don't import it from non-test code.
 - The contract's "60 s pause between non-empty ticks" is implemented with `time.sleep(BATCH_PAUSE_SECONDS)`. Tests set this to `0.0` via the `Settings` fixture; production picks up the default 60 from `MEMEX_WORKER_BATCH_PAUSE_SECONDS`.
+
+---
+
+## Phase 4 — Telegram bot
+
+**Date completed:** 2026-05-10
+**Session model:** Claude Opus 4.7 (1M context)
+
+### What was built
+- `telegram_bot/bot/config.py` — env-driven `Settings` dataclass; validates the bot token, the chat-id whitelist, the capture-API base URL/token, and timeouts.
+- `telegram_bot/bot/logging.py` — JSON-to-stdout logger with `service="telegram_bot"`; redacts secret-named keys, hashes chat IDs, body-substitutes message text/answer payloads. Adapted from `worker/worker/logging.py` per the Phase 3 hand-off.
+- `telegram_bot/bot/auth.py` — chat-ID whitelist check + silent-rejection log helper.
+- `telegram_bot/bot/intent.py` — pure-function intent dispatcher implementing CLAUDE.md's six ordered rules; one `Decision` dataclass per intent; rule 3 extracts URL + remnant `user_note`.
+- `telegram_bot/bot/capture_client.py` — async `httpx` wrapper for the capture API; one method per endpoint; raises `CaptureAPIError` on any non-2xx so handlers render uniformly.
+- `telegram_bot/bot/claude_runner.py` — subprocess wrapper for `claude -p --output-format json`; parses both envelope shapes (`result`-string and `result`-dict); validates the inner retrieval JSON; truncates quotes to 280 chars; distinct `ClaudeTimeoutError`/`ClaudeTransientError`/`ClaudeMalformedJSONError` classes drive the user-facing error rendering.
+- `telegram_bot/bot/rendering.py` — three-message renderer (answer / sources / quotes) per CLAUDE.md; chunks answer at paragraph boundaries with `(i/n)` numbering when the body exceeds 3500 chars; explicitly tracks open code-fence parity so a long fenced block is never split mid-fence; appends the `_No sources found in vault._` marker only on the final answer chunk.
+- `telegram_bot/bot/downloads.py` — in-memory Telegram download with declared-size and post-download size enforcement; never persists payloads to disk.
+- `telegram_bot/bot/queue_reader.py` — read-only SQLite (`mode=ro`) helpers for `/queue` (24-hour status counts) and `/last` (5 most recent rows).
+- `telegram_bot/bot/telemetry.py` — appends one row to `claude_calls` per retrieval with `service='telegram_bot'`, `purpose='retrieve'`, `queue_item_id=NULL`; swallows insert failures so telemetry can never crash the bot.
+- `telegram_bot/bot/handlers/{capture_url,capture_text,capture_attachment,retrieval,commands}.py` — one module per intent path. Capture handlers reply with `reply_to_message_id`; retrieval replies are plain (no quote of the question).
+- `telegram_bot/bot/main.py` — async entry point: chat whitelist, intent dispatcher, command bindings, `Application.builder()` wiring, long-polling startup. `claude -p` runs inside `asyncio.to_thread` so the event loop is never blocked.
+- `telegram_bot/prompts/retrieve.md` — `prompt_version: 1`; instructs the model to return ONLY the CLAUDE.md retrieval JSON envelope, with a complete schema example and verbatim-quote/280-char rules.
+- `telegram_bot/tests/*` — 11 test modules, 110 tests, **87.57 % coverage on `bot/`** (gate is 85 %).
+- `telegram_bot/Dockerfile` — Python 3.11-slim, `linux/arm64`-friendly. The Claude Code CLI is mounted from the host at runtime; not bundled.
+- `telegram_bot/pyproject.toml`, `telegram_bot/.dockerignore`, `telegram_bot/README.md`.
+
+### Key decisions made (and why)
+- **Followed `CLAUDE.md` over the Phase-4 prompt wherever they disagreed.** Specifically: commands are `/start /help /queue /last /find /capture` (not `/status /inbox /save /cancel`); intent rules are six (not eight) with all attachment kinds unified into rule 1; capture endpoints are plural (`/captures/voice`, not `/capture/voice`); rendering is three separate messages per CLAUDE.md (not one chunked message); chunking happens at 3500 chars with `(i/n)` numbering. Phase 2 set the precedent that CLAUDE.md is binding when the prompt and the contract disagree.
+- **Env-var prefix `MEMEX_TELEGRAM_*`** to match CLAUDE.md's named example `MEMEX_TELEGRAM_ALLOWED_CHAT_IDS` and the worker's `MEMEX_WORKER_*` convention. The capture-API token env var is `MEMEX_CAPTURE_API_TOKEN` (the bot doesn't know about labels — it just holds the token value that the API will recognise as `submitter='api:telegram'`).
+- **Default `MEMEX_CAPTURE_API_BASE_URL=http://capture_api:8001`** matches the port Phase 2 actually settled on (CLAUDE.md's prose example said 8000; Phase 2's `CAPTURE_BIND_PORT=8001` is the operational reality).
+- **Telegram payloads are downloaded to memory, never to disk.** The prompt asked for `tempfile.NamedTemporaryFile`, but going straight to bytes → multipart removes a class of cleanup bugs (no `try/finally` race, no leftover `.tmp` files). The 25 MB download cap is enforced both before (declared `file_size`) and after (actual buffer length) the download.
+- **`/queue` and `/last` read SQLite directly via `mode=ro` URI**, instead of fan-out over `GET /captures?status=...`. The dashboard already does the same, the bind mount already exists, and the `MEMEX_TELEGRAM_DB_PATH` env var points at the same file.
+- **`claude_calls` insertion is best-effort**: a missing DB or schema-not-yet-applied logs a warning and returns silently. This lets the bot run before the worker has applied its migrations on first boot, and means a corrupted DB doesn't take down retrievals.
+- **Code-fence-aware chunker.** The renderer parses each candidate chunk for an odd number of triple-backtick lines; if the count is odd, the next paragraph is appended rather than starting a new chunk. This guarantees a multi-paragraph fenced code block is never split mid-fence, even if it pushes a chunk above the 3500-char target (Telegram's hard cap is 4096; tests assert the produced chunks stay under it).
+- **No `python-telegram-bot` testing harness; bespoke fakes.** `FakeMessage`/`FakeChat`/`FakeBot`/`FakeUpdate` dataclasses live in `tests/conftest.py`. They give the test suite full control over attachment shapes and download bytes without spinning up a real `Application`. The trade-off is that we don't exercise PTB's filter logic; covered by the smoke step in §3 of the prompt's acceptance criteria when the bot runs against a real chat.
+- **Bot does not retry capture-API calls.** Per the prompt and consistent with the queue's deduplication-via-content model, the user resends if needed; double-captures are worse than dropped ones.
+
+### Deviations from the prompt spec
+- **Command set, intent ruleset, endpoint paths, rendering shape, and chunk size**: followed `CLAUDE.md` rather than the prompt — see "Key decisions" above. The prompt itself names CLAUDE.md as binding when the two disagree.
+- **Env-var names** are `MEMEX_TELEGRAM_*` not the prompt's bare `TELEGRAM_*`. Reason: matches CLAUDE.md (`MEMEX_TELEGRAM_ALLOWED_CHAT_IDS`) and the worker's prefix convention.
+- **Default capture API port is 8001** not 8000 (matches Phase 2's bind port).
+- **Telegram downloads are in-memory** not `tempfile.NamedTemporaryFile`. See above.
+- **`shared/memex_shared/` extraction is still deferred.** Three services now carry near-identical `logging.py` (capture API, worker, bot) and two carry the queue DDL. Phase 5 (Compose) is the natural moment to extract since Compose has to know which packages each service depends on; deferring further would force a fourth copy in the dashboard.
+
+### Deferred / left for later phases
+- `shared/memex_shared/` package extraction (logger, retrieval-envelope dataclasses, claude wrapper). Phase 5 or 6.
+- The bot does not subscribe to queue events for "your capture was filed" notifications — by contract it is stateless. The user finds out via `/last` or the dashboard. Phase 6 (dashboard) provides the durable surface.
+- Compose wiring of the bot service: bind mounts (`/vault`, `/srv/memex/data`, `/usr/local/bin/claude`) and env-file plumbing live in `infra/docker-compose.yml`, which Phase 5 authors. The Dockerfile here documents the expected mount points via `ENV` defaults so Compose only needs to override secrets.
+- Voice/audio captures are forwarded to `/captures/voice`; the worker (Phase 3) does the actual transcription via whisper.cpp. The bot does not transcribe.
+
+### Open questions / known issues
+- The retrieval prompt assumes `claude -p` with the vault directory in scope can read files via its built-in tools. If the installed CLI version cannot, the prompt template will need to embed file content in the prompt — that change lives entirely in `prompts/retrieve.md` and is reviewable on its own.
+- Telegram's effective inbound file ceiling for bots is ~20 MB, not 25 MB; we keep the 25 MB env cap to match the capture API's ceiling but the practical limit is set by Telegram. The bot rejects files declaring sizes over the cap before downloading; the post-download check handles the rare case where Telegram lies.
+- The bot uses `parse_mode="Markdown"` on retrieval messages. CLAUDE.md says "rendered as Markdown"; PTB v20 still accepts the legacy `Markdown` mode but Telegram has been pushing `MarkdownV2`. If Telegram start to reject `Markdown` payloads, switch to `MarkdownV2` and add the v2-required escapes in `rendering.py`.
+- `/queue` and `/last` show `(pending)` for rows whose `vault_path` is NULL; this includes both `queued` and `processing` and `failed`. Only the operator's eyes distinguish them today; if the dashboard renders status icons, the bot can adopt the same.
+- The bot does not validate at startup that `MEMEX_CAPTURE_API_TOKEN` is accepted by the capture API. A startup probe (`GET /healthz` first, then a no-op `GET /captures?limit=0`) was discussed but deferred — the first user message will surface the misconfiguration with a clear error in logs anyway.
+
+### Test status
+- `python -m pytest -q` → **110 passed, coverage 87.57 %** (gate is 85 %).
+- Coverage by module: `intent.py` 94 %, `rendering.py` 95 %, `claude_runner.py` 84 %, `capture_client.py` 85 %, `handlers/*` 91–100 %, `queue_reader.py` 96 %, `telemetry.py` 100 %, `auth.py` 100 %, `logging.py` 100 %.
+- `bot/main.py` is at 49 % — the uncovered branches are the `build_application`/`main` bootstrap that wire `python-telegram-bot`'s `Application` and the long-poll start; both need a live PTB stack and credentials, and were verified manually instead. The prompt's §3.2 list (whitelist, every intent rule, each capture endpoint, retrieval happy/long/timeout/malformed, every command, logging, auth headers) is fully exercised.
+- No skipped or flaky tests.
+- The capture API's bearer-token header is asserted on every mocked request.
+- The chunker test for the code-fence rule constructs a fenced block of ~2200 lines and verifies every produced chunk has an even fence count.
+
+### Notes for the next phase
+- **Compose (Phase 5):** mount the host's `claude` binary at `/usr/local/bin/claude` (read-only). Mount `/srv/memex/data` (the SQLite WAL set) read-write because the bot writes to `claude_calls`. Mount the vault read-only (the bot only ever reads it via `claude -p`, never writes). The bot needs network egress to `api.telegram.org` only — no inbound ports; do not publish anything from this service.
+- **Compose env file:** `MEMEX_CAPTURE_API_TOKEN` for the bot must equal the value of `MEMEX_CAPTURE_TOKEN_telegram` in the capture API service. The `submitter` column will then read `api:telegram` per the Phase 1 tracker note.
+- **Dashboard (Phase 6):** the retrieval prompt template at `telegram_bot/prompts/retrieve.md` is the same shape the dashboard backend should ship. The two surfaces share the JSON envelope schema (CLAUDE.md "Retrieval response schema"); only the renderer differs (3 messages vs 1 chat bubble). `bot/claude_runner.py::invoke` is reusable verbatim; `bot/rendering.py` is bot-specific.
+- The bot's container working directory is `/app`; the prompt template at runtime is read from `/app/prompts/retrieve.md`. The temp-file directory is irrelevant — downloads are in-memory.
+- The bot writes one row to `claude_calls` per retrieval, even on transient/timeout failures. Rate-limit dashboards should expect non-zero exit codes (`-1` timeout, `-2` malformed JSON, `-3` transient) as part of normal traffic rather than alert-worthy anomalies.
+- A `/find` argument that strips to empty replies with `Usage:` and does **not** call `claude -p`; the same is true for `/capture` with no body. The dashboard's chat surface should mirror this guard.
