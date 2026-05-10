@@ -25,3 +25,13 @@ htmlcov/
 
 # vault contents are never committed
 vault/
+
+# Dashboard frontend build output and node_modules
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+dashboard/frontend/*.tsbuildinfo
+dashboard/frontend/vite.config.js
+dashboard/frontend/vite.config.d.ts
+dashboard/.vite/
+dashboard/node_modules
+node_modules/

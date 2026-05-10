@@ -52,7 +52,7 @@ ui_ok "stack stopped"
 
 if (( PRUNE_IMAGES == 1 )); then
     ui_section "Removing built images"
-    for img in memex/capture_api:latest memex/worker:latest memex/telegram_bot:latest; do
+    for img in memex/capture_api:latest memex/worker:latest memex/telegram_bot:latest memex/dashboard:latest; do
         if docker image inspect "$img" >/dev/null 2>&1; then
             docker image rm "$img" || ui_warn "failed to remove $img"
         fi

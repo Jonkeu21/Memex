@@ -174,6 +174,7 @@ fi
 
 # Generated, never prompted.
 CAPTURE_TOKEN="$(openssl rand -hex 32)"
+DASHBOARD_TOKEN="$(openssl rand -hex 32)"
 
 # Use the running user's uid/gid for Syncthing.
 HOST_UID="$(id -u)"
@@ -192,6 +193,7 @@ if (( DRY_RUN == 1 )); then
   chat_ids:         ${CHAT_IDS:-(none)}
   uid/gid:          $HOST_UID/$HOST_GID
   capture_token:    [redacted, 64 hex chars]
+  dashboard_token:  [redacted, 64 hex chars]
   bot_token:        [redacted, accepted]
   Would write:      $ENV_FILE
   Would NOT run:    docker compose build/up, claude /login
@@ -263,6 +265,9 @@ MEMEX_TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 MEMEX_TELEGRAM_ALLOWED_CHAT_IDS=$CHAT_IDS
 MEMEX_TELEGRAM_CLAUDE_TIMEOUT_SECONDS=120
 MEMEX_TELEGRAM_MAX_DOWNLOAD_MB=25
+
+MEMEX_DASHBOARD_BEARER_TOKEN=$DASHBOARD_TOKEN
+MEMEX_DASHBOARD_CLAUDE_TIMEOUT_SECONDS=120
 
 MEMEX_LOG_LEVEL=INFO
 EOF
@@ -356,6 +361,10 @@ Vault is at:        $VAULT_PATH      (Syncthing's canonical copy)
 Queue + uploads:    $DATA_PATH
 Syncthing UI:       ssh -L 8384:127.0.0.1:8384 <pi-host>  →  http://127.0.0.1:8384
 Claude login state: docker volume "memex_claude_auth"
+
+Dashboard:          http://<pi-tailscale-host>:8002/
+                    Paste this token into the dashboard's Settings drawer:
+                    $DASHBOARD_TOKEN
 
 EOF
 ui_ok "bootstrap complete."
