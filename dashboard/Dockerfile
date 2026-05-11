@@ -67,7 +67,12 @@ ENV MEMEX_DASHBOARD_VAULT_DIR=/vault \
     MEMEX_DASHBOARD_FRONTEND_DIST_DIR=/app/frontend/dist \
     MEMEX_DASHBOARD_BIND_HOST=0.0.0.0 \
     MEMEX_DASHBOARD_BIND_PORT=8002 \
-    MEMEX_LOG_LEVEL=INFO
+    MEMEX_LOG_LEVEL=INFO \
+    HOME=/home/memex
+# ^ HOME is /home/memex (not /app) so claude -p reads its credentials from
+#   the shared claude_auth volume at /home/memex/.claude. useradd above sets
+#   /app as the home dir for WORKDIR/pip purposes, but the Claude CLI reads
+#   $HOME/.claude/ regardless of the passwd entry.
 
 EXPOSE 8002
 
