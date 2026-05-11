@@ -753,3 +753,92 @@ How to use this (operator-facing): no setup change. Click the **Retrieval** page
 
 **Corrections:** None.
 
+---
+
+## Change — Dashboard queue page background-poll on 5s interval
+
+**Date:** 2026-05-11
+**Session model:** Claude Opus 4.7 (1M context)
+
+**Requested by / context:** Operator request. Note already in `dashboard/frontend/src/pages/Queue.tsx`'s prior commit (`7b72cc7`) called out that the queue page only refetches on mount, filter change, refresh-icon click, or retry/cancel — i.e. nothing happens while you sit on the page watching the worker process items. Operator framed this as "fine for a homelab single-operator setup; for multi-operator, `setInterval` re-fetch (or a `tab-focus` listener) would be the next improvement." This Change ships exactly that.
+
+**Type:** new feature (background polling).
+**Scope:** small — one component, one test.
+**Risk:** low. Frontend only. No state writes, no contract changes, no schema migrations, no env vars. The added traffic is one `GET /api/v1/queue` every 5 s per open queue page (and zero while the tab is hidden) against a single-user dashboard.
+
+**Summary:** The queue page (`dashboard/frontend/src/pages/Queue.tsx`) now refreshes itself on a 5 s interval. Polling pauses when `document.visibilityState === 'hidden'` and resumes (with one immediate catch-up fetch) on visibility-regain. An `inFlightRef` skips overlapping requests so a slow API tick can't pile up; background fetches don't flash the loading spinner or stomp on the action banner. The cadence matches `MEMEX_WORKER_POLL_SECONDS=5` so the page reflects status transitions within roughly one worker tick.
+
+**Plan executed:**
+1. Read `CLAUDE.md`, search Progress-Tracker for prior queue / dashboard work; confirmed the predecessor Change (`7b72cc7`) is exactly the trigger for this one.
+2. Add `QUEUE_POLL_INTERVAL_MS = 5000` constant and refactor `load()` to take a `{ background?: boolean }` arg that gates the loading-spinner side-effect.
+3. Add a second `useEffect` that owns the interval + visibilitychange listener; depend on the memoised `load` so filter changes restart the interval cleanly.
+4. Add a Vitest test using `vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })` so `screen.findBy*` and `waitFor` keep working against real microtasks while the polling timer is controlled.
+5. Run `npm test`, `npm run lint`, `npm run build` in `dashboard/frontend/` — all clean.
+6. Commit locally on the agent branch (`36d83d6`), apply the same file diff onto `/home/johann.keusgen/memex` main (`715c5bf`) without touching the operator's pre-existing uncommitted Dockerfile WIP, then rebuild and restart only the `dashboard` service.
+7. Verify post-deploy: bundle bytes grew minimally (+~280 B for the polling code), the deployed JS contains `visibilitychange` (3 hits) and `5000` (1 hit), `/api/v1/queue` returns the same payload three probes in a row, `service_started` log line is clean, no errors in the post-restart log window.
+8. Push the change to the GitHub mirror on a feature branch (`claude/unruffled-poitras-d6c44e`) rebased onto origin/main so the operator's local `main` divergence does not contaminate the mirror.
+
+**Files changed (commit `36d83d6` in worktree, mirrored to `715c5bf` on local main, pushed as `4063e58` after rebase onto origin/main):**
+- `dashboard/frontend/src/pages/Queue.tsx` — export `QUEUE_POLL_INTERVAL_MS`, rewrap `load` in `useCallback` taking an optional `background` flag, add an interval-owning effect that pauses on `document.visibilitychange` and catches up on visibility-regain.
+- `dashboard/tests/frontend/pages.test.tsx` — add a 13th test: `Queue page > automatically refetches the queue on a background interval`. Uses surgical fake-timers (`toFake: ['setInterval', 'clearInterval']`) so the rest of the suite (and `findBy*`) keep using real timers.
+- `dashboard/frontend/package-lock.json` — npm normalised `@testing-library/dom` from `dependencies` to `devDependencies` during `npm install`; benign metadata diff carried along with the actual code change.
+
+**Contract impact:** None. `CLAUDE.md` does not specify a dashboard polling cadence. The cadence simply mirrors `MEMEX_WORKER_POLL_SECONDS=5` (already in the contract's "Worker contract" section) as a derived choice in code.
+
+**Migration:** None. Frontend-only change; no schema, no data, no env vars introduced.
+
+**Tests added:**
+- `Queue page > automatically refetches the queue on a background interval` — renders the page, asserts the first item is rendered, advances fake `setInterval` by `QUEUE_POLL_INTERVAL_MS + 50` ms, asserts the fetch was called at least twice and the new item appears. Fails today if the polling effect is removed; previously-passing 12 tests stay green.
+
+**Rollback recipe:**
+```bash
+# Revert the commit and rebuild the dashboard:
+cd /home/johann.keusgen/memex
+git revert 715c5bf                                # local main
+docker compose -f infra/docker-compose.yml up -d --build dashboard
+# Or, if the operator chose to land the rebased mirror commit 4063e58
+# on origin/main via PR and pull it down, the equivalent revert is the
+# same: git revert <merged-sha> && docker compose up -d --build dashboard.
+```
+No state to restore. No `.env` change. The dashboard image rebuild takes ~40 s on the Pi (most layers cache; only the Vite stage re-runs).
+
+**Verification:**
+1. `npm test` (in worktree, `dashboard/frontend/`): **13 passed** (12 previous + 1 new). Full suite ran clean against jsdom.
+2. `npm run lint` (tsc --noEmit): clean.
+3. `npm run build`: clean; no new bundle warnings.
+4. `docker compose -f /home/johann.keusgen/memex/infra/docker-compose.yml up -d --build dashboard`: rebuilt the dashboard image and recreated the container; capture_api was also recreated (transitive — same compose-up call), both came back healthy within ~30 s.
+5. `docker compose ps`: `memex-dashboard-1 Up (healthy)`; capture_api, worker, telegram_bot, syncthing also healthy and unaffected by the dashboard rebuild.
+6. `curl http://localhost:8002/healthz` → `{"status":"ok"}`; service_started log entry shows expected `db_path`, `vault_dir`, `frontend_dist`.
+7. `curl http://localhost:8002/api/v1/queue?limit=1` → 200 with item #2 (the YouTube-KSP capture filed earlier today) — endpoint the polling will hit is healthy.
+8. Three sequential `curl` probes of `/api/v1/queue?limit=5`: all HTTP 200, no error spam in the dashboard log window.
+9. Bundle inspection: the deployed `/assets/index-DN8cc4rE.js` contains the string `visibilitychange` (3 hits — `addEventListener`, `removeEventListener`, and the case check) and the literal `5000` exactly once (the interval constant). Confirms the polling code shipped.
+
+**Pushed to mirror:** Yes. `git push -u origin claude/unruffled-poitras-d6c44e` to `https://github.com/Jonkeu21/Memex.git` succeeded on the first try. GitHub returned the PR-creation link: `https://github.com/Jonkeu21/Memex/pull/new/claude/unruffled-poitras-d6c44e`. The branch sits cleanly on top of `origin/main` (commit `fa2a408`, the merged PR #8 from the previous Change session) — my commit is `4063e58 feat(dashboard): background-poll queue every 5s; pause on hidden tab`. A follow-up commit will land the Progress-Tracker entry on the same branch.
+
+Local main on the Pi (`/home/johann.keusgen/memex`) carries the same change as commit `715c5bf` on top of the operator's pre-existing unpushed `8180ded`. That divergence pre-dates this session (the operator's earlier Change entry documents that `8180ded` was fast-forward-merged but main's two Dockerfile diffs blocked further FF merges); deploying from local main produced the running production image without touching that prior state.
+
+**Failed attempts:**
+- First attempt deployed `docker compose -f infra/docker-compose.yml up -d --build dashboard` from the worktree path. Compose tried to read the service-level `env_file: ./.env` (relative to the compose file) and failed because `.env` is gitignored and only lives in the main repo. Falling back to `--env-file <abs path>` would only have covered compose-level variable interpolation, not the per-service `env_file:` directive. Tried to symlink the main `.env` into the worktree; the harness denied that as a secrets-exposure escalation, correctly. Settled on the deploy-from-main path: `git checkout 36d83d6 -- <files>` to copy my three files into main's working tree (leaving the operator's WIP untouched), commit on main, build from main.
+- First push to `origin main` was rejected: remote had moved forward via PR #8 (`fa2a408`) which the operator had merged earlier today and not yet fetched on this machine. Did not try to rebase or merge local main into origin/main because that would have either dropped the operator's unpushed `8180ded` or pushed it without their say-so. Pivoted to pushing the agent branch instead: rebased `claude/unruffled-poitras-d6c44e` onto `origin/main` (dropping `8180ded` from my branch's parent chain since it's not on origin), then pushed.
+
+**User-facing changes:** Yes — visible on the Queue page only.
+- The list now refreshes itself once every 5 seconds while the dashboard tab is in the foreground. Status transitions land without a manual refresh click; the refresh icon still works for an instant pull.
+- The list does **not** poll while the tab is in the background — switching away and coming back triggers one immediate refetch, then the 5 s cadence resumes.
+- The loading spinner only appears on mount, filter change, refresh-icon click, or retry/cancel. Background polls update the table silently. The error banner still fires if a background poll fails, but the table keeps showing the last successful payload rather than blanking out.
+- "Active filter" interactions are unchanged: switching the status dropdown still triggers a foreground load with the spinner.
+
+How to use this (operator-facing): no setup change. Open `https://memex-dashboard.<tailnet>.ts.net/queue` (or whatever Tailscale-serve hostname the operator configured for the dashboard), watch the list. To verify polling is alive: open DevTools → Network, filter by `queue`, and you should see one `GET /api/v1/queue` every 5 s. Switching to a different browser tab pauses the polling; coming back fires one immediate refetch.
+
+**Open follow-ups:**
+- Reconcile local main with origin/main on `/home/johann.keusgen/memex`. Local main has `715c5bf` (my polling commit) on top of `8180ded` (operator's unpushed earlier fix). Remote main has `fa2a408` (PR #8 superseding `8180ded`'s problem space). The operator should decide whether `8180ded` is still useful or was fully superseded by `61b60a6`'s detailed retrieval-chat fixes. Two safe paths: (a) `git fetch && git rebase -i origin/main` and drop `8180ded` if PR #8 made it redundant, or (b) merge the agent branch's PR through GitHub and reset local main to match.
+- Polling for the **Inbox** and **RateLimit** pages too. Both have the same "refresh-only-on-action" property; the Inbox page especially benefits because the worker drops new items there autonomously. Out of scope for this Change (one change per session), but the pattern in `Queue.tsx` is reusable: lift the polling effect into a `useBackgroundRefetch(load, ms)` hook in `dashboard/frontend/src/hooks/` if a second consumer materialises.
+- A small Settings toggle for the polling interval — useful if the operator ever wants to disable background traffic on a metered network (e.g. tethered mobile). Today the constant is hardcoded; a localStorage-backed setting (mirroring `useToken`) would be a one-file addition.
+
+**Notes for next change session:**
+- The agent branch `claude/unruffled-poitras-d6c44e` was rebased onto `origin/main` after the initial commit. The pre-rebase commit (`36d83d6`) still exists in the worktree's reflog but is no longer the branch tip. If a follow-up session needs the exact commit content I tested locally, prefer `4063e58` on origin.
+- The `node_modules` symlink workaround for vitest (Phase 6 working note) is still required. After `npm install` in `dashboard/frontend/`, you also need `ln -s frontend/node_modules dashboard/node_modules` for the tests to find `@testing-library/jest-dom/vitest`. This is documented in the Phase 6 entry and the dashboard README; mention it here so the next session doesn't re-debug the resolution error.
+- `vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })` is the right pattern for testing intervals in this codebase — it keeps `screen.findBy*` and `waitFor` working against real microtasks. Faking all timers will hang those.
+- When the dashboard depends on shared state (`capture_api` is `depends_on`), `docker compose up -d --build dashboard` will recreate capture_api too as part of the dependency chain. This is benign — capture_api came back healthy in ~10 s — but it's a brief capture outage that surprised me on the first run. Schedule rebuilds during low-traffic windows.
+
+**Corrections:** None.
+
