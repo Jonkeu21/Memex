@@ -177,6 +177,36 @@ def test_retrieval_missing_prompt_returns_500(client: TestClient, auth_headers) 
     assert resp.json()["detail"]["error"]["code"] == "prompt_unreadable"
 
 
+def test_retrieval_falls_back_to_real_invoke_when_state_is_none(
+    client: TestClient, auth_headers, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production wiring: ``app.state.claude_runner_invoke`` is initialised to
+    ``None`` and only test code overwrites it. The router must fall through to
+    the module-level ``invoke`` symbol in that case rather than calling
+    ``None`` (which raises ``TypeError: 'NoneType' object is not callable``
+    and produces a bare 500 with no error envelope).
+    """
+    assert client.app.state.claude_runner_invoke is None  # baseline
+
+    calls: list[dict] = []
+
+    def fake_invoke(*, claude_bin, prompt, timeout_seconds):
+        calls.append({"claude_bin": claude_bin, "timeout_seconds": timeout_seconds})
+        return _ok_outcome()
+
+    import backend.routers.retrieval as retrieval_module
+
+    monkeypatch.setattr(retrieval_module, "invoke", fake_invoke)
+    resp = client.post(
+        "/api/v1/retrieval",
+        headers=auth_headers,
+        json={"question": "did the fallback fire?"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["claude_bin"] == "/usr/local/bin/claude-fake"
+
+
 # ── claude_runner unit tests ────────────────────────────────────────────────
 
 def test_claude_runner_parses_envelope_with_string_result() -> None:
