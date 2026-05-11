@@ -145,6 +145,7 @@ export function RetrievalPage(): JSX.Element {
                 }
               }}
               inputProps={{ 'aria-label': 'retrieval question' }}
+              sx={{ '& .MuiOutlinedInput-root': { minHeight: 44 } }}
             />
             <Tooltip title={hasToken ? 'Send (⌘/Ctrl + Enter)' : 'Set bearer token in Settings'}>
               <span>
@@ -154,6 +155,7 @@ export function RetrievalPage(): JSX.Element {
                   disabled={!hasToken || !draft.trim()}
                   onClick={() => void send()}
                   size="large"
+                  sx={{ height: 44, flexShrink: 0 }}
                 >
                   Ask
                 </Button>

@@ -114,13 +114,18 @@ async def retrieve(payload: RetrievalRequest, request: Request) -> RetrievalResp
         vault_dir=settings.vault_dir,
     )
 
-    runner = getattr(request.app.state, "claude_runner_invoke", invoke)
+    # ``app.py`` initialises ``claude_runner_invoke`` to ``None`` so tests can
+    # set it without monkey-patching; ``getattr``'s third arg is the default
+    # only when the attribute is *absent*, so we ``or invoke`` to fall back
+    # when it is present but ``None``.
+    runner = getattr(request.app.state, "claude_runner_invoke", None) or invoke
 
     def _invoke():
         return runner(
             claude_bin=settings.claude_bin,
             prompt=prompt,
             timeout_seconds=settings.claude_timeout_seconds,
+            add_dirs=[str(settings.vault_dir)],
         )
 
     try:

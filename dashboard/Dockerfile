@@ -24,11 +24,27 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Node + npm are needed only to install the Claude Code CLI. See
+# worker/Dockerfile for the rationale: the npm-global install puts the binary
+# at /usr/local/bin/claude (outside $HOME) so the auth-state volume mount at
+# /home/memex/.claude can be shared with worker + telegram_bot without
+# clobbering the binary.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund --omit=dev @anthropic-ai/claude-code \
+    && claude --version \
+    && rm -rf /root/.npm
+
 # Same uid/gid as the other Memex services so vault bind-mounts have uniform
 # ownership semantics.
 RUN groupadd --system --gid 10001 memex \
     && useradd  --system --uid 10001 --gid memex --home-dir /app --shell /usr/sbin/nologin memex \
-    && mkdir -p /home/memex/.claude /vault /srv/memex/data \
+    && mkdir -p /app /home/memex/.claude /vault /srv/memex/data \
     && chown -R memex:memex /app /home/memex /vault /srv/memex/data
 
 COPY pyproject.toml /tmp/pyproject.toml
@@ -51,7 +67,12 @@ ENV MEMEX_DASHBOARD_VAULT_DIR=/vault \
     MEMEX_DASHBOARD_FRONTEND_DIST_DIR=/app/frontend/dist \
     MEMEX_DASHBOARD_BIND_HOST=0.0.0.0 \
     MEMEX_DASHBOARD_BIND_PORT=8002 \
-    MEMEX_LOG_LEVEL=INFO
+    MEMEX_LOG_LEVEL=INFO \
+    HOME=/home/memex
+# ^ HOME is /home/memex (not /app) so claude -p reads its credentials from
+#   the shared claude_auth volume at /home/memex/.claude. useradd above sets
+#   /app as the home dir for WORKDIR/pip purposes, but the Claude CLI reads
+#   $HOME/.claude/ regardless of the passwd entry.
 
 EXPOSE 8002
 

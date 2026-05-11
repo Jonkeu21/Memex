@@ -657,3 +657,99 @@ How to use this: nothing to do. The page behaves the way the operator expected t
 
 **Corrections:** None.
 
+
+---
+
+## Change — Dashboard retrieval chat works end-to-end
+
+**Date:** 2026-05-11
+**Session model:** Claude Opus 4.7 (1M context)
+**Requested by / context:** Operator: "The Retrieval chat function doesn't work, it just returns 500 Internal Server Error. There is also a UI issue with the height of the send button and the chat input not being the same height." Screenshot showed a "Question" card with a red "500 Internal Server Error" banner and a misaligned input/button row beneath it.
+
+**Type:** bug fix (one operator-reported symptom, five distinct underlying defects).
+**Scope:** medium — touches dashboard backend (router, runner), frontend (one page), Dockerfile, and one test file. No contract change. No schema migration.
+**Risk:** low. The biggest delta is image size: stage-2 now installs `nodejs`/`npm` and the Claude Code CLI (~150 MiB on disk), mirroring worker/telegram_bot. No state migration, no host filesystem change, no port change. Existing services (capture_api, worker, telegram_bot, syncthing) are untouched.
+
+**Summary:** The operator's "500" was the visible tip of five separate bugs that all blocked the dashboard's retrieval chat. In order of discovery:
+
+1. **`retrieval.py:117` used `getattr(..., default)` incorrectly.** `app.py:67` initialises `app.state.claude_runner_invoke = None` so tests can inject a fake; the router did `runner = getattr(state, "claude_runner_invoke", invoke)`. Python returns the existing `None`, not the default, when the attribute is present. Result: `runner(...)` → `TypeError: 'NoneType' object is not callable` → bare 500.
+2. **`dashboard/Dockerfile` never installed the Claude CLI.** Phase 6's image set `MEMEX_DASHBOARD_CLAUDE_BIN=/usr/local/bin/claude` and mounted the shared `claude_auth` volume, but missed the npm-global install step that worker/telegram_bot's Dockerfiles do. Verifying fix 1 turned a 500 into a 502 with `code: claude_transient, message: "claude binary not found: /usr/local/bin/claude"`.
+3. **`HOME` was `/app`, not `/home/memex`.** Dashboard's `useradd --home-dir /app` (so WORKDIR /app matches the passwd home for pip's sake) put `$HOME` at `/app`. But the shared `claude_auth` volume mounts at `/home/memex/.claude`. The CLI reads `$HOME/.claude/.credentials.json`, so `claude -p` exited 1 with `"Not logged in · Please run /login"` (caught by `_AUTH_ERROR_MARKERS`).
+4. **`/app` mkdir missing before chown.** Discovered while syncing the worktree's Dockerfile with the operator's local workaround. `useradd --home-dir /app` does not create `/app`; the subsequent `chown -R memex:memex /app ...` then fails if WORKDIR /app hasn't run yet (depending on layer cache). The operator was carrying this as an uncommitted local patch on the Pi clone; this Change folds it into the codebase.
+5. **`claude -p` had no `--add-dir /vault` flag.** Even after auth worked, retrieval returned `{"answer":"","sources":[],"confidence":0.0}` after ~31s. The full envelope's `permission_denials` array showed Read/Bash/Grep all denied on `/vault/*` because the CLI sandboxes tool access to the process cwd (`/app`). `claude_runner.invoke` now accepts an `add_dirs: list[str] | None` kwarg that translates to one `--add-dir <path>` per entry; the retrieval router passes `[str(settings.vault_dir)]`. The telegram_bot's near-duplicate runner is documented in "Open follow-ups" — same bug, not fixed here because the operator did not report a Telegram-side retrieval failure and the runner extraction is also deferred.
+
+**Plan executed:** Initial plan was a trivial two-line fix (router + sx prop). Each of the five issues was discovered by the §3.7 verification step (real `curl POST /api/v1/retrieval` against the live dashboard). Every time the test surfaced a deeper layer, the plan was extended in-session rather than deferred. Final scope is described in "Files changed" below.
+
+**Files changed (commit SHAs are on branch `claude/sweet-roentgen-b2b5e3` in this Pi clone):**
+- `dashboard/backend/routers/retrieval.py` — `runner = getattr(..., None) or invoke` (handles the None-attribute case); pass `add_dirs=[str(settings.vault_dir)]` to the runner. Commits `8180ded`, `2c81dce`.
+- `dashboard/backend/claude_runner.py` — new `add_dirs` kwarg on `invoke()` expanding to `--add-dir <path>` flags. Commit `2c81dce`.
+- `dashboard/frontend/src/pages/Retrieval.tsx` — `sx={{ '& .MuiOutlinedInput-root': { minHeight: 44 } }}` on the TextField, `sx={{ height: 44, flexShrink: 0 }}` on the Button. Commit `8180ded`.
+- `dashboard/tests/backend/test_retrieval.py` — new test `test_retrieval_falls_back_to_real_invoke_when_state_is_none` asserts the production-default path (state is `None`) reaches the real `backend.routers.retrieval.invoke` symbol and threads the vault dir into `add_dirs`. Commits `8180ded`, `2c81dce`.
+- `dashboard/Dockerfile` — apt-install `nodejs`/`npm`/`ca-certificates`; `npm install -g --omit=dev @anthropic-ai/claude-code` with a `claude --version` smoke check; add `/app` to the existing `mkdir -p ...` so chown can succeed; add `HOME=/home/memex` to the runtime ENV with a comment explaining the split between passwd home (`/app`, for WORKDIR/pip) and `$HOME` (where claude looks for `.claude/`). Commits `1b29cda`, `555b329`, `bd9e552`.
+
+**Contract impact:** None. The `RetrievalResponse` envelope is unchanged. `MEMEX_DASHBOARD_CLAUDE_BIN`, `MEMEX_DASHBOARD_VAULT_DIR`, `MEMEX_DASHBOARD_CLAUDE_TIMEOUT_SECONDS` are all unchanged. The router still maps the same exception taxonomy to the same status codes (504/503/502/502/502). No `.env` change is required.
+
+**Migration:** None. No schema change, no on-disk state change.
+
+**Tests added:** `test_retrieval_falls_back_to_real_invoke_when_state_is_none` in `dashboard/tests/backend/test_retrieval.py`. Asserts that when `app.state.claude_runner_invoke` is `None` (the production default), the router falls through to `backend.routers.retrieval.invoke` AND threads `add_dirs=[str(settings.vault_dir)]` so the CLI can actually read the vault. Tests also indirectly exercise the new `add_dirs` kwarg via the updated `_install_runner` helper which now accepts `add_dirs=None` without error.
+
+**Rollback recipe:**
+```bash
+# Revert all five commits at once. They are sequential on main on the Pi
+# clone, so a single revert range works:
+git -C /home/johann.keusgen/memex revert --no-edit 8180ded^..2c81dce
+docker buildx build --platform linux/arm64 --load \
+    -t memex/dashboard:latest \
+    /home/johann.keusgen/memex/dashboard
+docker compose -f /home/johann.keusgen/memex/infra/docker-compose.yml \
+    up -d --no-build dashboard
+# Rolled-back state: retrieval chat returns 500 again (TypeError) and
+# the dashboard image lacks the claude CLI. Other services unaffected.
+```
+
+**Verification:**
+1. `python -m pytest tests/backend/` in a one-shot `memex/dashboard:latest` container (post-image-rebuild) → **185 passed, 88.79 % coverage** (was 184/88.88 % at Phase 6; +1 for the new regression test, slight coverage drop from added but partially-exercised lines in `claude_runner.invoke`).
+2. `docker buildx build ... -t memex/dashboard:latest dashboard/` succeeded on ARM64; image size grew from ~190 MiB to ~340 MiB due to nodejs/npm + @anthropic-ai/claude-code (matches worker/telegram_bot sizing).
+3. `docker compose ps` after `up -d --no-build dashboard`: all five services healthy, dashboard healthcheck green within ~22s.
+4. Inside the dashboard container: `ls -la /usr/local/bin/claude` shows the npm-global symlink to `claude.exe`; `claude --version` reports `2.1.139 (Claude Code)`; `echo "say hi" | claude -p` returns a valid envelope with `is_error: false`.
+5. End-to-end retrieval via `curl POST /api/v1/retrieval` with the dashboard bearer token, question "What does my Raspberry Pi Wikipedia note say about the processor?": **HTTP 200** in 46 s with `confidence: 0.95`, 1 source (`resources/2026-05-11--raspberry-pi-wikipedia-german.md`, `exists: true`), 6 verbatim German quotes; a row was appended to `claude_calls` with `service='dashboard', purpose='retrieve', exit_code=0`.
+6. `docker compose logs dashboard --since 5m | grep -iE "error|exception|traceback"` is empty (no error spam in capture_api, worker, telegram_bot, or syncthing logs either).
+
+**Pushed to mirror:** Yes. `git push origin claude/sweet-roentgen-b2b5e3` succeeded on the first try (the Pi has GitHub credentials configured now — likely added by the operator between this session and the prior Change). All six commits on the feature branch reached the mirror:
+- `8180ded` — fix(dashboard): retrieval chat 500 + Ask button height
+- `1b29cda` — fix(dashboard): install claude CLI in image (Phase 6 gap)
+- `555b329` — fix(dashboard): create /app before chown in Dockerfile
+- `bd9e552` — fix(dashboard): set HOME=/home/memex so claude finds credentials
+- `2c81dce` — fix(dashboard): pass --add-dir <vault> to claude -p for retrieval
+- `61b60a6` — docs(progress-tracker): record retrieval-chat end-to-end fix
+Push timestamp: 2026-05-11 (UTC). Branch URL: `https://github.com/Jonkeu21/Memex/tree/claude/sweet-roentgen-b2b5e3`. PR creation link surfaced by GitHub: `https://github.com/Jonkeu21/Memex/pull/new/claude/sweet-roentgen-b2b5e3`. Only `8180ded` has been fast-forward-merged into local `main` on the Pi clone; the remaining five commits are still only on the feature branch locally because `git merge --ff-only` refused to advance `main` while `dashboard/Dockerfile` and `worker/Dockerfile` carried uncommitted diffs in the main repo's working tree, and `git stash` was denied by the harness as a scope escalation. Two non-destructive paths for the operator to advance `main` to `61b60a6`:
+- `cd /home/johann.keusgen/memex && git stash push -u -m "pre-change-dockerfile-diffs" dashboard/Dockerfile worker/Dockerfile && git merge --ff-only claude/sweet-roentgen-b2b5e3 && git stash pop` — stash, FF, and re-apply the local diffs on top. After this Change, `dashboard/Dockerfile`'s `/app` mkdir is already in HEAD so the stash pop will report that hunk as "already applied"; only `worker/Dockerfile`'s whisper-cli revert remains as a local diff.
+- Or commit those two local diffs first (the dashboard `/app` mkdir is folded into `555b329` already, so its standalone commit would be a no-op), then `git merge --ff-only claude/sweet-roentgen-b2b5e3` and `git push origin main`. Alternatively, open the PR from the link above and merge through GitHub's UI; that path doesn't touch the Pi's working tree at all.
+
+**Failed attempts:**
+- Initial fix shipped commit `8180ded` (router fallback + sx) and was rebuilt via `docker compose -f infra/docker-compose.yml build dashboard` from the main repo path. Verification surfaced bug 2 (no CLI binary). Rolled forward, not back: continued with commits `1b29cda`, `555b329`, `bd9e552`, `2c81dce` rather than re-running the test loop from scratch.
+- After committing the CLI install (`1b29cda`), `git merge --ff-only` failed in the main repo with `error: Your local changes to ... would be overwritten by merge`. The harness denied `git stash` as a scope escalation. Switched to building directly from the worktree path (`docker buildx build ... /home/johann.keusgen/memex/.claude/worktrees/sweet-roentgen-b2b5e3/dashboard`) and tagging `memex/dashboard:latest` manually; `docker compose up -d --no-build dashboard` then used the manually-tagged image without re-reading the compose-level build context. This is the technique used for the final image actually running in production.
+- One verification call (commit `bd9e552` applied — CLI installed, HOME set) returned `{"answer":"","sources":[],"confidence":0.0}` (HTTP 200). Treated as success initially until investigating the raw `claude -p` output revealed the `permission_denials` array; that drove the `--add-dir` fix in `2c81dce`.
+
+**User-facing changes:** Yes — the operator's stated problem is resolved:
+- The Retrieval chat now returns real answers from vault content, not a 500. Confirmed against the German Wikipedia Raspberry Pi note: claude reads the file, returns markdown with structured quotes, lists the source as a clickable chip in the side drawer, and reports `confidence: 0.95`.
+- The chat input box and the "Ask" button now both render at 44 px high (matched). The input still grows up to 4 lines of text when typing a long question; the button stays anchored at the bottom-right.
+
+How to use this (operator-facing): no setup change. Click the **Retrieval** page in the dashboard sidebar, type a question, click **Ask** (or press Cmd/Ctrl + Enter). Sources appear as primary-coloured chips below the answer — clicking one opens the note in the side drawer. The "Open in Obsidian" icon next to each chip uses `obsidian://open?path=…` and only works if Obsidian is installed and configured on the device viewing the dashboard.
+
+**Open follow-ups:**
+- **`telegram_bot/bot/claude_runner.py` has the same `--add-dir` gap.** Its `invoke()` signature lacks `add_dirs`, so `/find` and any retrieval-shaped Telegram intent will hit the same `permission_denials` and return empty. Not fixed in this session because (a) the operator only reported the dashboard symptom, and (b) the runner duplication itself (called out in Phase 6 as deferred) is the real cleanup. Next change session should either mirror the kwarg into `telegram_bot/bot/claude_runner.py` or finally extract `shared/memex_shared/claude.py`. The Telegram bot's retrieval prompt should likewise pass `settings.vault_dir`.
+- **Image-size diet for the dashboard.** Stage 2 now carries nodejs + npm + claude-code (~150 MiB). Worker and telegram_bot are in the same boat; a future iteration could share a single "claude-base" image (debian-slim + npm-installed CLI) that all three services build `FROM`.
+- **Pin `@anthropic-ai/claude-code` version across services.** The Dockerfile pulls the floating latest tag on each fresh build. Today: worker is on 2.1.138 (built earlier), dashboard pulled 2.1.139 (built this session). They share the `claude_auth` volume; auth has stayed compatible across this patch range. The right hardening is `npm install -g @anthropic-ai/claude-code@<pinned>` in all three Dockerfiles, with a documented bump procedure (rebuild all three, re-login if the credentials schema changed).
+- **`obsidian://open?path=…` and the missing `_trash/` documentation** carried forward from Phase 6 and the prior Change entries; not addressed here.
+- **The dashboard `claude -p` retrieval takes ~30–50 s for a single small-vault question.** That is one Wikipedia article (~80 KB) + a KSP guide (~150 KB). On a larger vault this will get expensive. A future iteration could pre-build an FTS5 index that claude can grep cheaply (deferred from Phase 6); paired with a `--system-prompt` that hands claude a "candidate paths" shortlist.
+
+**Notes for next change session:**
+- `app.state.claude_runner_invoke` is the test-injection hook. Use `client.app.state.claude_runner_invoke = fake_invoke` in tests; the production path uses `None` and the router falls through to `backend.routers.retrieval.invoke`. Both code paths are now tested.
+- The dashboard's runtime user has `passwd_home=/app` (for WORKDIR/pip) and `$HOME=/home/memex` (for `~/.claude/`). These intentionally diverge. Do not unify them without checking both Claude Code and uvicorn's working-directory expectations.
+- Building the dashboard image from the worktree (rather than from `/home/johann.keusgen/memex/dashboard`) is the workaround for pre-existing uncommitted edits in the main repo's working tree. The technique is: `docker buildx build -t memex/dashboard:latest <worktree>/dashboard && docker compose up -d --no-build dashboard`. The compose-level `build:` block points at the main repo's path; manually-tagging short-circuits it without modifying compose.
+- The `claude -p` call inside the dashboard container needs `--add-dir <vault_dir>` to read the vault. Worker's claude calls today still don't have this; worker doesn't currently use claude's Read tool (it pipes URL-extracted content into the prompt and claude returns metadata) so the absence has been invisible. If worker grows a code path that uses claude's Read/Grep, plumb `--add-dir` there too.
+- The Pi clone at `/home/johann.keusgen/memex/` had two pre-existing uncommitted Dockerfile diffs at the start of this session (carried over from the vault-permissions Change). One of them (`dashboard/Dockerfile`'s `/app` mkdir) was folded into commit `555b329` in this Change. The other (`worker/Dockerfile`'s whisper-cli → main target revert) is unrelated and was not touched.
+
+**Corrections:** None.
+
