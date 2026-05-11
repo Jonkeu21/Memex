@@ -44,7 +44,7 @@ RUN npm install -g --no-audit --no-fund --omit=dev @anthropic-ai/claude-code \
 # ownership semantics.
 RUN groupadd --system --gid 10001 memex \
     && useradd  --system --uid 10001 --gid memex --home-dir /app --shell /usr/sbin/nologin memex \
-    && mkdir -p /home/memex/.claude /vault /srv/memex/data \
+    && mkdir -p /app /home/memex/.claude /vault /srv/memex/data \
     && chown -R memex:memex /app /home/memex /vault /srv/memex/data
 
 COPY pyproject.toml /tmp/pyproject.toml
