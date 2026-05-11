@@ -177,15 +177,23 @@ def invoke(
     claude_bin: str,
     prompt: str,
     timeout_seconds: float,
+    add_dirs: list[str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> RetrievalOutcome:
     """Run ``claude -p`` and return the parsed retrieval outcome.
+
+    ``add_dirs`` translates to one ``--add-dir <path>`` flag per entry, granting
+    the Read/Grep/Bash tools access to those directories. Without this, the CLI
+    sandboxes tool use to the process cwd and denies reads of the vault, so the
+    retrieval call returns ``{"answer":"","sources":[],"confidence":0.0}``.
 
     ``runner`` is an injection point for tests; if ``None``, ``subprocess.run``
     is used.
     """
     runner = runner or subprocess.run
     args = [claude_bin, "-p", "--output-format", "json"]
+    for path in add_dirs or ():
+        args.extend(["--add-dir", path])
     started = time.monotonic()
     try:
         result = runner(

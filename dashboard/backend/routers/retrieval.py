@@ -125,6 +125,7 @@ async def retrieve(payload: RetrievalRequest, request: Request) -> RetrievalResp
             claude_bin=settings.claude_bin,
             prompt=prompt,
             timeout_seconds=settings.claude_timeout_seconds,
+            add_dirs=[str(settings.vault_dir)],
         )
 
     try:

@@ -190,8 +190,12 @@ def test_retrieval_falls_back_to_real_invoke_when_state_is_none(
 
     calls: list[dict] = []
 
-    def fake_invoke(*, claude_bin, prompt, timeout_seconds):
-        calls.append({"claude_bin": claude_bin, "timeout_seconds": timeout_seconds})
+    def fake_invoke(*, claude_bin, prompt, timeout_seconds, add_dirs=None):
+        calls.append({
+            "claude_bin": claude_bin,
+            "timeout_seconds": timeout_seconds,
+            "add_dirs": add_dirs,
+        })
         return _ok_outcome()
 
     import backend.routers.retrieval as retrieval_module
@@ -205,6 +209,8 @@ def test_retrieval_falls_back_to_real_invoke_when_state_is_none(
     assert resp.status_code == 200, resp.text
     assert len(calls) == 1
     assert calls[0]["claude_bin"] == "/usr/local/bin/claude-fake"
+    # The router must pass the vault dir through so claude can read it.
+    assert calls[0]["add_dirs"] == [str(client.app.state.settings.vault_dir)]
 
 
 # ── claude_runner unit tests ────────────────────────────────────────────────
