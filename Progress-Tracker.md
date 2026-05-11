@@ -598,3 +598,62 @@ How to use this (operator-facing): nothing changes in normal use. If the vault p
 
 **Corrections:** None.
 
+
+---
+
+## Change — Dashboard queue list refreshes on retry/cancel error
+
+**Date:** 2026-05-11
+**Session model:** Claude Opus 4.7 (1M context)
+**Requested by / context:** Same session as the vault-permissions Change above. After the worker filed queue id=1 (the previously-failed Wikipedia URL capture), the operator opened the dashboard queue page (which had been loaded earlier, before the worker succeeded) and saw item #1 still rendered with a red "Failed" badge. Clicking the retry icon produced the banner `cannot retry item in status 'filed'; only 'failed' or 'needs_review' items may be retried`. The backend was correct; the frontend was stale.
+
+**Type:** bug fix (UI/UX).
+**Scope:** trivial — three lines moved into a `finally` block in one frontend file; one dashboard image rebuild; no backend, schema, or contract change.
+**Risk:** low. Changes a React component's error-path; the only behavioural change is that the queue list re-fetches after a retry/cancel error response, which the user previously had to do manually with the refresh icon.
+
+**Summary:** `dashboard/frontend/src/pages/Queue.tsx` previously only called `load()` (the queue re-fetch) on the success branch of `handleRetry` and `handleCancel`. On error, the action banner was shown but the list was not refreshed, so a stale row (e.g. "Failed" when the row had actually been filed) kept its old badge. Moved `void load()` into a `finally` block in both handlers, so the list re-syncs with the backend's truth whether the action succeeded or failed. A short comment explains the 409 path.
+
+**Plan executed:** As described in the summary. No deviations.
+
+**Files changed:**
+- `dashboard/frontend/src/pages/Queue.tsx` — moved `void load()` from the success branch into a `finally` block in `handleRetry` and `handleCancel`. Added a one-line comment in `handleRetry` noting that the 409 path commonly means the row's status changed since the page was loaded.
+
+**Contract impact:** None.
+**Migration:** None.
+
+**Tests added:** None. The behaviour is a one-line UX change on an existing handler; there is no Vitest / Jest suite in `dashboard/frontend/` to extend, and the change is in the catch path of a network call which is awkward to mock at the level the existing tests target. Caught at the eye-test level instead.
+
+**Rollback recipe:**
+```
+# Revert the source change:
+#   in dashboard/frontend/src/pages/Queue.tsx, move `void load()` back into
+#   the success branches of handleRetry / handleCancel and delete the finally
+#   block.
+docker compose -f infra/docker-compose.yml build dashboard
+docker compose -f infra/docker-compose.yml up -d dashboard
+```
+
+**Verification:**
+1. `docker compose build dashboard` — clean build, frontend bundle produced, no errors.
+2. `docker compose up -d dashboard` — container recreated, healthcheck passes within 22 s.
+3. `curl http://127.0.0.1:8002/healthz` → `{"status":"ok"}`.
+4. Manual operator verification: the operator should reload the dashboard once and confirm that next time they click retry on a row whose status has changed under them, the list re-syncs after the error banner appears.
+
+**Pushed to mirror:** Committed locally as `<hash-of-this-commit>` on the same `main` branch initialised earlier in this session. Push still blocked by the same missing GitHub credentials on the Pi as the previous Change entry. Once the operator wires up auth (`gh auth login` + `gh auth setup-git`, or SSH key, or PAT via `git credential-store`), `git push origin main` will deliver both commits.
+
+**Failed attempts:** None.
+
+**User-facing changes:** Yes. After this deploy:
+- Clicking the retry or cancel icon now refreshes the queue list regardless of whether the action succeeded or failed.
+- Practical effect: if a row's actual status diverged from what the page shows (because the worker processed it after page load, or another operator triaged it), the badge will catch up immediately rather than after a manual refresh.
+
+How to use this: nothing to do. The page behaves the way the operator expected the first time.
+
+**Open follow-ups:**
+- The queue page has no background polling. It refreshes only on mount, filter change, refresh-icon click, or after a retry/cancel action. For a homelab single-operator system this is fine; for a multi-operator setup, adding a `setInterval` re-fetch (or a `tab-focus` listener) would be the next improvement.
+- The error banner's text comes from the backend verbatim. The current message (`cannot retry item in status 'filed'; only 'failed' or 'needs_review' items may be retried`) is technically accurate but reads as an instruction to the operator rather than an explanation; a future Change could soften it to "Item #1 has already been filed since you opened this page — refreshed."
+
+**Notes for next change session:** The frontend lives in `dashboard/frontend/` and is built into `dashboard/frontend/dist/` by stage 1 of `dashboard/Dockerfile` (Node 20 + Vite). Source-only changes inside `dashboard/frontend/src/` need a `docker compose build dashboard && docker compose up -d dashboard` to take effect; the FastAPI backend container serves the static bundle, not the source.
+
+**Corrections:** None.
+

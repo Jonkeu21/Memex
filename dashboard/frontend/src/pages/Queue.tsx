@@ -73,9 +73,13 @@ export function QueuePage(): JSX.Element {
     try {
       await queueApi.retry(id);
       setActionMessage(`Item #${id} re-queued.`);
-      void load();
     } catch (e) {
+      // 409 commonly means the row's status changed since the page was last
+      // loaded (e.g. the worker filed it after the user opened the queue).
+      // Reload either way so the badge re-syncs with the backend's truth.
       setActionMessage(e instanceof ApiHttpError ? e.message : 'Retry failed');
+    } finally {
+      void load();
     }
   };
 
@@ -84,9 +88,10 @@ export function QueuePage(): JSX.Element {
     try {
       await queueApi.cancel(id);
       setActionMessage(`Item #${id} cancelled.`);
-      void load();
     } catch (e) {
       setActionMessage(e instanceof ApiHttpError ? e.message : 'Cancel failed');
+    } finally {
+      void load();
     }
   };
 
