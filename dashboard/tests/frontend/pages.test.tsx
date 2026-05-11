@@ -1,11 +1,11 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ThemeProvider } from '@mui/material/styles';
 import { CssBaseline } from '@mui/material';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildTheme } from '../../frontend/src/theme';
-import { QueuePage } from '../../frontend/src/pages/Queue';
+import { QueuePage, QUEUE_POLL_INTERVAL_MS } from '../../frontend/src/pages/Queue';
 import { InboxPage } from '../../frontend/src/pages/Inbox';
 import { TaxonomyPage } from '../../frontend/src/pages/Taxonomy';
 import { CapturesPage } from '../../frontend/src/pages/Captures';
@@ -91,6 +91,65 @@ describe('Queue page', () => {
     await screen.findByText('#1');
     const retryButton = screen.getByLabelText('retry item 1');
     expect(retryButton).not.toBeDisabled();
+  });
+
+  it('automatically refetches the queue on a background interval', async () => {
+    let callCount = 0;
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/queue')) {
+        callCount += 1;
+        const id = callCount === 1 ? 1 : 2;
+        const status = callCount === 1 ? 'queued' : 'filed';
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id,
+                created_at: '2026-05-11T12:00:00.000000Z',
+                updated_at: '2026-05-11T12:00:00.000000Z',
+                source_type: 'url',
+                source_payload: { url: 'https://example.com' },
+                submitter: 'api:telegram',
+                status,
+                attempts: 1,
+                last_error: null,
+                processed_at: null,
+                confidence: null,
+                vault_path: null,
+                claude_session_id: null,
+                claude_input_tokens: null,
+                claude_output_tokens: null,
+                claude_duration_ms: null,
+              },
+            ],
+            next_cursor: null,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('{}', { status: 404 });
+    }) as unknown as typeof global.fetch;
+
+    // Only fake setInterval/clearInterval so screen.findBy* and act keep working
+    // against the real microtask queue.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      renderPage(<QueuePage />);
+      expect(await screen.findByText('#1')).toBeInTheDocument();
+      expect(callCount).toBe(1);
+
+      await act(async () => {
+        vi.advanceTimersByTime(QUEUE_POLL_INTERVAL_MS + 50);
+      });
+
+      await waitFor(() => {
+        expect(callCount).toBeGreaterThanOrEqual(2);
+      });
+      expect(await screen.findByText('#2')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -26,7 +26,7 @@ import RefreshIcon from '@mui/icons-material/RefreshOutlined';
 import CloseIcon from '@mui/icons-material/CloseOutlined';
 import ReplayIcon from '@mui/icons-material/ReplayOutlined';
 import CancelIcon from '@mui/icons-material/CancelOutlined';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiHttpError } from '../api/client';
 import { queueApi } from '../api/endpoints';
 import { StatusChip } from '../components/StatusChip';
@@ -34,6 +34,10 @@ import { useToken } from '../hooks/useToken';
 import type { QueueItem, QueueStatus } from '../types/api';
 
 const STATUSES: (QueueStatus | 'all')[] = ['all', 'queued', 'processing', 'filed', 'needs_review', 'failed'];
+
+// Matches the worker's poll cadence (MEMEX_WORKER_POLL_SECONDS=5) so the
+// dashboard reflects status transitions within roughly one worker tick.
+export const QUEUE_POLL_INTERVAL_MS = 5000;
 
 export function QueuePage(): JSX.Element {
   const { hasToken } = useToken();
@@ -43,25 +47,71 @@ export function QueuePage(): JSX.Element {
   const [filter, setFilter] = useState<QueueStatus | 'all'>('all');
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
 
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const params = filter === 'all' ? undefined : { status: filter };
-      const resp = await queueApi.list(params);
-      setItems(resp.items);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load queue');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const load = useCallback(
+    async ({ background = false }: { background?: boolean } = {}) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      if (!background) {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        const params = filter === 'all' ? undefined : { status: filter };
+        const resp = await queueApi.list(params);
+        setItems(resp.items);
+        if (background) setError(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to load queue');
+      } finally {
+        if (!background) setLoading(false);
+        inFlightRef.current = false;
+      }
+    },
+    [filter],
+  );
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter]);
+  }, [load]);
+
+  // Background polling. Pauses when the tab is hidden so a phone left on the
+  // queue page doesn't keep hammering the API, and refetches once on
+  // visibility-regain to catch up on whatever changed while away.
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const start = () => {
+      if (interval !== null) return;
+      interval = setInterval(() => {
+        void load({ background: true });
+      }, QUEUE_POLL_INTERVAL_MS);
+    };
+    const stop = () => {
+      if (interval !== null) {
+        clearInterval(interval);
+        interval = null;
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void load({ background: true });
+        start();
+      } else {
+        stop();
+      }
+    };
+
+    if (document.visibilityState === 'visible') start();
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [load]);
 
   const selected = useMemo(
     () => items.find((i) => i.id === selectedId) ?? null,
