@@ -24,6 +24,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Node + npm are needed only to install the Claude Code CLI. See
+# worker/Dockerfile for the rationale: the npm-global install puts the binary
+# at /usr/local/bin/claude (outside $HOME) so the auth-state volume mount at
+# /home/memex/.claude can be shared with worker + telegram_bot without
+# clobbering the binary.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nodejs \
+        npm \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --no-audit --no-fund --omit=dev @anthropic-ai/claude-code \
+    && claude --version \
+    && rm -rf /root/.npm
+
 # Same uid/gid as the other Memex services so vault bind-mounts have uniform
 # ownership semantics.
 RUN groupadd --system --gid 10001 memex \
