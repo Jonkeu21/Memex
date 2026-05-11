@@ -308,3 +308,14 @@ def test_syncthing_web_ui_bound_to_localhost(parsed: dict):
     host_ip = web[0].get("host_ip", "") or web[0].get("published", "")
     # docker compose config emits host_ip="127.0.0.1" for our binding.
     assert "127.0.0.1" in str(host_ip) or web[0].get("host_ip") == "127.0.0.1", web[0]
+
+
+@pytest.mark.parametrize("service", ["worker", "telegram_bot", "dashboard"])
+def test_host_gid_in_supplementary_groups(parsed: dict, service: str):
+    """worker/telegram_bot/dashboard run as uid 10001 but must also be in the
+    host operator's gid (MEMEX_GID) so they can read/write vault files that
+    Syncthing replicated in from the Mac side as uid:MEMEX_GID."""
+    groups = parsed["services"][service].get("group_add", []) or []
+    assert "1000" in [str(g) for g in groups], (
+        f"{service} must have ${{MEMEX_GID}} in group_add, got {groups}"
+    )

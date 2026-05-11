@@ -84,6 +84,14 @@ services:
         condition: service_healthy
     env_file:
       - ./.env
+    # The container's memex user (uid 10001) is added to the host operator's
+    # gid (MEMEX_GID, typically 1000) as a supplementary group. The vault on
+    # the host is owned by 10001:${MEMEX_GID} with SGID-set dirs (mode 2770),
+    # so worker-written files inherit gid ${MEMEX_GID} and group rwx — letting
+    # Syncthing (PUID/PGID=${MEMEX_GID}) and the host operator read and write
+    # the same tree without permission flips between writers.
+    group_add:
+      - "${MEMEX_GID:-1000}"
     environment:
       MEMEX_WORKER_DB_PATH: /srv/memex/data/memex.db
       MEMEX_WORKER_VAULT_DIR: /vault
@@ -133,6 +141,12 @@ services:
         condition: service_healthy
     env_file:
       - ./.env
+    # See the comment on `worker.group_add` above. The telegram_bot mounts the
+    # vault read-only, so it doesn't strictly need group-write, but staying in
+    # the host gid keeps any stat / readdir behaviour identical to the worker
+    # and dashboard and is harmless for a read-only mount.
+    group_add:
+      - "${MEMEX_GID:-1000}"
     environment:
       MEMEX_TELEGRAM_BOT_TOKEN: "${MEMEX_TELEGRAM_BOT_TOKEN}"
       MEMEX_TELEGRAM_ALLOWED_CHAT_IDS: "${MEMEX_TELEGRAM_ALLOWED_CHAT_IDS}"
@@ -231,6 +245,12 @@ services:
         condition: service_healthy
     env_file:
       - ./.env
+    # See the comment on `worker.group_add` above. The dashboard mounts the
+    # vault read-write (inbox routing renames files, frontmatter patches
+    # rewrite them), so it needs to be in the host gid to edit files that
+    # Syncthing replicated in from the Mac side as uid:${MEMEX_GID}.
+    group_add:
+      - "${MEMEX_GID:-1000}"
     environment:
       MEMEX_DASHBOARD_BEARER_TOKEN: "${MEMEX_DASHBOARD_BEARER_TOKEN}"
       MEMEX_DASHBOARD_VAULT_DIR: /vault

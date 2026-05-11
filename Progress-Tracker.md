@@ -524,3 +524,77 @@ Tests + ops:
 - **Bootstrap default reconciliation.** As noted in "Deferred", changing `"300"` to `"60"` in `scripts/bootstrap.sh` line 152 (the `PAUSE_SECONDS` prompt) would resolve the only contract divergence the install guide has to step around. A patch-level contract version bump is not required because `CLAUDE.md` already pins the default at 60.
 
 
+---
+
+## Change — Vault host filesystem ownership / supplementary gid
+
+**Date:** 2026-05-11
+**Session model:** Claude Opus 4.7 (1M context)
+**Requested by / context:** Operator hit `vault_write_failed: [Errno 13] Permission denied: '/vault/resources/2026-05-11--raspberry-pi-wikipedia-artikel.md.tmp'` on the first real capture submitted to the running stack (queue item id=1, source_type=url). Worker exhausted its five-retry budget and marked the row `failed`. Operator filed the change with "best guess: permissions of the program."
+
+**Type:** bug fix.
+**Scope:** small — host filesystem repair + one-line compose addition per service + bootstrap update; no image rebuild.
+**Risk:** low. Broadens host filesystem access on `/srv/memex/vault` from "uid 1000 only" to "uid 10001 owner + gid 1000 group, others none." No data is deleted or moved. No schema or contract change.
+
+**Summary:** The worker / telegram_bot / dashboard containers all run as uid 10001 (memex), but `scripts/bootstrap.sh` was creating `/srv/memex/vault` with the host operator's uid:gid (1000:1000) mode 750, and the PARA subdirs (`resources`, `_inbox`, etc.) were being created later by the host user as 1000:1000 mode 2755 (drwxr-sr-x) — leaving uid 10001 unable to create the `.tmp` file in any subdir. The fix has three parts: a one-shot live `chown -R 10001:${MEMEX_GID}` + `chmod 2770` on the existing tree; `group_add: [${MEMEX_GID:-1000}]` on worker/telegram_bot/dashboard in `infra/docker-compose.yml` so container-side processes inherit the host gid as a supplementary group; and an updated `scripts/bootstrap.sh` that creates the vault root + the seven PARA subdirs as `10001:${HOST_GID}` mode 2770 from day one.
+
+**Plan executed:** Matches the §3.2 plan. No deviations.
+
+**Files changed:**
+- `infra/docker-compose.yml` — added `group_add: ["${MEMEX_GID:-1000}"]` to the worker, telegram_bot, and dashboard services. Each has a short comment explaining why.
+- `scripts/bootstrap.sh` — Step 4 now creates the vault root and seven PARA subdirs (`_inbox`, `_attachments`, `_meta`, `projects`, `areas`, `resources`, `archive`) owned by `10001:${HOST_GID}` mode 2770, and the data dir owned the same way. Syncthing config stays at `${HOST_UID}:${HOST_GID}` because syncthing runs as the host uid. The `create_dir` helper now also reapplies ownership/mode when the dir already exists, which makes a second `bootstrap.sh --force` self-repairing.
+- `scripts/fix-vault-permissions.sh` — new, idempotent. Re-runnable repair script that operators (or this kind of session) can invoke against an existing install to restore correct ownership and mode without destroying anything. Reads `MEMEX_VAULT_PATH` and `MEMEX_GID` from `infra/.env`; accepts an explicit path argument as override.
+- `tests/compose/test_compose_config.py` — added a parametrised test (`test_host_gid_in_supplementary_groups`) asserting that worker, telegram_bot, and dashboard each have gid 1000 in `group_add`.
+
+**Contract impact:** None. The vault folder structure section of `CLAUDE.md` already requires a writable vault; the host-side filesystem contract (who owns which directory, with what mode) is a deployment concern documented in the bootstrap script's comments rather than the `CLAUDE.md` contract surface. `contract_version` unchanged.
+
+**Migration:** None at the schema level. A host-side filesystem migration was applied live with `sudo chown -R 10001:1000 /srv/memex/vault && sudo find /srv/memex/vault -type d -exec chmod 2770 {} + && sudo find /srv/memex/vault -type f -exec chmod 0660 {} +`. No backup was taken because the change broadens permissions, does not delete data, and is fully described by the four `chown`/`chmod` commands above, which are themselves reversible by re-running them with the original `1000:1000` and `750`/`644` values.
+
+**Tests added:** `tests/compose/test_compose_config.py::test_host_gid_in_supplementary_groups` (parametrised across worker, telegram_bot, dashboard). Asserts that each service has gid 1000 in its compose-rendered `group_add` list, which is what makes the supplementary-group fix robust against future compose edits that delete it by mistake.
+
+**Rollback recipe:** This change does not have a previous-healthy state to roll back to (the system never successfully filed a note before this change). If a regression is found later, the rollback is:
+```
+# Revert file changes (no git on the Pi clone; restore from the
+# GitHub mirror or re-edit the three files):
+#   infra/docker-compose.yml             remove the three `group_add:` blocks
+#   scripts/bootstrap.sh                 restore the Step 4 block to the pre-change version
+#   scripts/fix-vault-permissions.sh     delete
+#   tests/compose/test_compose_config.py remove the test_host_gid_in_supplementary_groups test
+
+docker compose -f infra/docker-compose.yml up -d worker telegram_bot dashboard
+sudo chown -R 1000:1000 /srv/memex/vault
+sudo find /srv/memex/vault -type d -exec chmod 0755 {} +
+sudo find /srv/memex/vault -type f -exec chmod 0644 {} +
+```
+The rolled-back state is the original "worker cannot write" state. If a true regression appears that is worse than that, the right move is to investigate, not to roll back.
+
+**Verification:**
+1. Live smoke write from inside the worker container: `docker compose exec worker sh -c 'touch /vault/resources/.permcheck && rm /vault/resources/.permcheck'` returned `SMOKE_OK`.
+2. Worker now reports its supplementary groups: `groups=10001(memex),1000`.
+3. Reset queue id=1 via the dashboard's documented retry endpoint (`POST /api/v1/queue/1/retry` with the dashboard bearer token), then watched the worker logs. Within one batch tick the worker emitted `item_processed, status=filed, vault_path=resources/2026-05-11--raspberry-pi-wikipedia-german.md, confidence=0.92, duration_ms=9893`.
+4. Filed note exists on disk: `/srv/memex/vault/resources/2026-05-11--raspberry-pi-wikipedia-german.md` (82,274 bytes, owner 10001, group 1000, mode 0644).
+5. SQLite queue row: id=1, status=`filed`, confidence=0.92, vault_path resolved, last_error cleared.
+6. `docker compose ps`: all five services (capture_api, worker, telegram_bot, dashboard, syncthing) healthy.
+7. `python -m pytest tests/` → 46 passed, 0 failed (43 compose tests including the 3 new ones + 3 env coverage tests).
+
+**Pushed to mirror:** Not yet. The Pi clone at `/home/johann.keusgen/memex/` is not a git repository (`git status` reports `fatal: not a git repository`), so the standard "commit locally, push to mirror" step cannot run from this session. Flagged in the handback summary — the operator should decide how to reconcile the Pi clone with the GitHub mirror at `https://github.com/Jonkeu21/Memex` (init + remote add + push from here, or apply the same edits on the mirror clone and pull).
+
+**Failed attempts:** None. The first plan worked end-to-end.
+
+**User-facing changes:** None directly. The system now files captures instead of failing them, which is the only operator-visible difference: queue items reach `filed` status. The dashboard's queue list will show the new note instead of an indefinite "failed" row.
+
+How to use this (operator-facing): nothing changes in normal use. If the vault permissions are ever observed to drift again (rare; would require a manual `chown` on the host or a new bootstrap run on a fresh disk), run `scripts/fix-vault-permissions.sh` from the repo root — it is idempotent and safe to re-run.
+
+**Open follow-ups:**
+- Mac→Pi Syncthing replication writes new files as `${MEMEX_UID}:${MEMEX_GID}` with the operator's umask (typically 0644). The dashboard's frontmatter patches use `Path.write_text` which requires write on the target file. If the operator edits a Syncthing-replicated file via Obsidian and the dashboard later tries to clear `needs_review` on it, `Path.write_text` will fail because gid 1000 only has read on a 0644 file. Mitigation deferred: either set syncthing's umask to 002 (so replicated files end up 0664) or add POSIX default ACLs (`setfacl -d -m g:1000:rw`) on the vault dirs. Not worth the complexity until the case actually bites.
+- The `worker/Dockerfile` hardcodes `APP_UID=10001` / `APP_GID=10001`. A cleaner long-term shape would plumb `MEMEX_WORKER_UID` through `infra/.env` and reference it in both the Dockerfile build-args and the bootstrap script's `MEMEX_WORKER_UID=` constant. Cosmetic — both places carry comments pointing at the magic number.
+- The `bats tests/compose/test_bootstrap.bats` suite would also benefit from a check that the vault is created as `uid 10001` mode `2770`. Not added in this session because `bats` is not installed on this Pi and the change was already at the small/medium boundary.
+
+**Notes for next change session:**
+- `id 10001` is **not** a host user. It is the in-image `memex` user defined in `worker/Dockerfile:48-49`, `telegram_bot/Dockerfile:12-13`, and `dashboard/Dockerfile:29-30`. From the host you see only the numeric uid because no host user has that uid. Do not be tempted to "fix" the bare number by inventing a host user.
+- The vault file mode (0644 vs 0664) only matters across writers. The worker is the only writer for newly captured notes and owns them, so 0644 is fine for worker-only paths. The dashboard re-writes files (frontmatter patches, inbox routing); both run as uid 10001 too, so they share ownership and 0644 is also fine for those. The only cross-writer case is Mac→Pi syncthing replication, captured in "Open follow-ups."
+- The Pi clone at `/home/johann.keusgen/memex/` was not a git working copy when this session started. Future sessions that follow the "Engineered prompt — Post-install changes" workflow will hit the same issue at the commit step until that is resolved.
+- `docker compose exec worker` (and the equivalent for telegram_bot / dashboard) is now sufficient to verify supplementary groups: `id` inside the container shows `groups=10001(memex),1000`.
+
+**Corrections:** None.
+

@@ -206,21 +206,45 @@ fi
 
 ui_section "Host directories"
 
+# The worker, telegram_bot, and dashboard containers all run as uid 10001
+# (the in-image `memex` user; see worker/Dockerfile:48-49). The vault must
+# therefore be owned by uid 10001 with the host operator's gid as the group,
+# and have SGID set on dirs so worker-written files inherit that gid. The
+# compose file adds the host gid as a supplementary group to those three
+# services (`group_add`), keeping the host operator, Syncthing
+# (PUID/PGID=${MEMEX_GID}), and the worker all able to write the same tree.
+#
+# Mode 2770 (drwxrws---) keeps the vault private to owner + group; "others"
+# on the host see nothing.
+readonly MEMEX_WORKER_UID=10001
+readonly VAULT_DIRS=(_inbox _attachments _meta projects areas resources archive)
+
 create_dir() {
-    local p="$1"
+    local p="$1" owner_uid="$2" mode="$3"
     if [[ -d "$p" ]]; then
-        ui_info "exists: $p"
-        return 0
+        ui_info "exists: $p (reapplying ownership/mode)"
+    else
+        ui_info "creating $p (will prompt for sudo)"
+        sudo mkdir -p "$p"
     fi
-    ui_info "creating $p (will prompt for sudo)"
-    sudo mkdir -p "$p"
-    sudo chown "$HOST_UID:$HOST_GID" "$p"
-    sudo chmod 750 "$p"
+    sudo chown "$owner_uid:$HOST_GID" "$p"
+    sudo chmod "$mode" "$p"
 }
-create_dir "$VAULT_PATH"
-create_dir "$DATA_PATH"
-create_dir "$SYNCTHING_CONFIG"
-mkdir -p "$DATA_PATH/uploads"
+
+# Vault: owned by the worker uid, host gid, SGID on so subdirs inherit gid.
+create_dir "$VAULT_PATH" "$MEMEX_WORKER_UID" 2770
+for sub in "${VAULT_DIRS[@]}"; do
+    create_dir "$VAULT_PATH/$sub" "$MEMEX_WORKER_UID" 2770
+done
+
+# Data + uploads: also owned by the worker uid (capture_api writes uploads,
+# worker reads them; both run as uid 10001).
+create_dir "$DATA_PATH" "$MEMEX_WORKER_UID" 2770
+create_dir "$DATA_PATH/uploads" "$MEMEX_WORKER_UID" 2770
+
+# Syncthing config: owned by the host gid only — Syncthing runs as the host
+# uid (PUID=${MEMEX_UID}) and is the sole writer here.
+create_dir "$SYNCTHING_CONFIG" "$HOST_UID" 2770
 
 # ─── Step 5: write infra/.env ───────────────────────────────────────────────
 
